@@ -1,8 +1,8 @@
-# CodeFinder
+# CodeMap
 
 > A high-performance semantic code graph server for AI agents
 
-CodeFinder is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that builds and maintains a real-time semantic graph of your codebase. It combines rapid AST parsing with Language Server Protocol integration to provide AI agents with deep code understanding, dependency tracking, and impact analysis.
+CodeMap is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that builds and maintains a real-time semantic graph of your codebase. It combines rapid AST parsing with Language Server Protocol integration to provide AI agents with deep code understanding, dependency tracking, and impact analysis.
 
 ## Features
 
@@ -65,14 +65,14 @@ go build -o codemap main.go
 ./codemap
 ```
 
-That's it! CodeFinder will:
+That's it! CodeMap will:
 1. Index your workspace (1-2 seconds)
 2. Start watching for file changes
 3. Launch the MCP server on stdio
 
 ## Usage
 
-### Running CodeFinder
+### Running CodeMap
 
 ```bash
 # Simply run in your project directory
@@ -205,7 +205,7 @@ Find where a symbol is defined.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                     CodeFinder                          │
+│                     CodeMap                          │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
 │  ┌───────────────────────────────────────────────┐     │
@@ -314,7 +314,7 @@ Find where a symbol is defined.
 
 ### Language Server Requirements
 
-CodeFinder **requires** language servers to be installed:
+CodeMap **requires** language servers to be installed:
 
 | Language | Server | Installation |
 |----------|--------|--------------|
@@ -323,7 +323,7 @@ CodeFinder **requires** language servers to be installed:
 | JavaScript/TypeScript | typescript-language-server | `npm install -g typescript-language-server typescript` |
 | Lua | lua-language-server | `brew install lua-language-server` |
 
-**Why required?** Without LSP servers, CodeFinder cannot generate edges (relationships between symbols), making the graph incomplete and the `find_impact` tool useless.
+**Why required?** Without LSP servers, CodeMap cannot generate edges (relationships between symbols), making the graph incomplete and the `find_impact` tool useless.
 
 ### Verification
 
@@ -399,7 +399,7 @@ which lua-language-server        # Lua
 ```
 1. Developer saves file
    ↓
-2. CodeFinder detects change (via fsnotify)
+2. CodeMap detects change (via fsnotify)
    ↓
 3. Waits 500ms (debounce)
    ↓
@@ -547,7 +547,7 @@ go test -race ./...
 
 ### "Language server(s) not found"
 
-**Problem:** CodeFinder can't find required language servers.
+**Problem:** CodeMap can't find required language servers.
 
 **Solution:** Install missing servers:
 ```bash
@@ -596,10 +596,10 @@ sudo sysctl -p
 
 ## FAQ
 
-**Q: Does CodeFinder work with monorepos?**  
+**Q: Does CodeMap work with monorepos?**  
 A: Yes, but consider the size. Very large monorepos (>50k files) may hit system watch limits.
 
-**Q: Can I use CodeFinder in CI/CD?**  
+**Q: Can I use CodeMap in CI/CD?**  
 A: Yes, but file watching is always on. For CI/CD, you may want a `--index-only` flag (not yet implemented).
 
 **Q: Does it support remote filesystems?**  
@@ -608,14 +608,14 @@ A: File watching may not work on network drives. Use locally for best results.
 **Q: How much disk space does the database use?**  
 A: Roughly 1MB per 1000 nodes. A typical project with 10k symbols = ~10MB database.
 
-**Q: Can multiple CodeFinder instances run in the same directory?**  
+**Q: Can multiple CodeMap instances run in the same directory?**  
 A: No, SQLite database locking prevents this. Use one instance per workspace.
 
 **Q: Does it preserve the graph between runs?**  
 A: Yes! The SQLite database persists in `.ctxhub/codegraph.sqlite`.
 
 **Q: How do I reset the graph?**  
-A: Delete the database: `rm -rf .ctxhub/` and restart CodeFinder.
+A: Delete the database: `rm -rf .ctxhub/` and restart CodeMap.
 
 ## Limitations
 
@@ -627,7 +627,7 @@ A: Delete the database: `rm -rf .ctxhub/` and restart CodeFinder.
 
 ## Comparison
 
-| Feature | CodeFinder | Language Server | IDE Plugin |
+| Feature | CodeMap | Language Server | IDE Plugin |
 |---------|------------|-----------------|------------|
 | **Cross-language** | ✅ 5 languages | ❌ Single | ⚠️ Varies |
 | **Persistent graph** | ✅ SQLite | ❌ In-memory | ⚠️ Varies |
