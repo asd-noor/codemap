@@ -17,8 +17,8 @@ import (
 
 	ignore "github.com/sabhiram/go-gitignore"
 
-	"codefinder/internal/graph"
-	"codefinder/util"
+	"codemap/internal/graph"
+	"codemap/util"
 )
 
 type Scanner struct {

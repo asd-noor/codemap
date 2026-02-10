@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"os"
 
-	"codefinder/internal/graph"
-	"codefinder/internal/lsp"
-	"codefinder/internal/scanner"
+	"codemap/internal/graph"
+	"codemap/internal/lsp"
+	"codemap/internal/scanner"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )

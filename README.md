@@ -52,17 +52,17 @@ brew install lua-language-server
 
 ```bash
 # Clone and build
-git clone https://github.com/yourusername/codefinder.git
-cd codefinder
+git clone https://github.com/yourusername/codemap.git
+cd codemap
 
 # Using mise (recommended)
 mise run build
 
 # Or using standard Go
-go build -o codefinder main.go
+go build -o codemap main.go
 
 # Run
-./codefinder
+./codemap
 ```
 
 That's it! CodeFinder will:
@@ -77,7 +77,7 @@ That's it! CodeFinder will:
 ```bash
 # Simply run in your project directory
 cd /path/to/your/project
-/path/to/codefinder
+/path/to/codemap
 
 # Or via mise
 mise run run
@@ -96,8 +96,8 @@ Add to your MCP client configuration:
 ```json
 {
   "mcpServers": {
-    "codefinder": {
-      "command": "/path/to/codefinder"
+    "codemap": {
+      "command": "/path/to/codemap"
     }
   }
 }
@@ -108,8 +108,8 @@ For Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.
 ```json
 {
   "mcpServers": {
-    "codefinder": {
-      "command": "/absolute/path/to/codefinder",
+    "codemap": {
+      "command": "/absolute/path/to/codemap",
       "args": []
     }
   }
@@ -419,8 +419,8 @@ which lua-language-server        # Lua
 Using `mise` (recommended):
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/codefinder.git
-cd codefinder
+git clone https://github.com/yourusername/codemap.git
+cd codemap
 
 # Install dependencies and tools
 mise install
@@ -441,14 +441,14 @@ mise run vet
 Using standard Go:
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/codefinder.git
-cd codefinder
+git clone https://github.com/yourusername/codemap.git
+cd codemap
 
 # Install dependencies
 go mod download
 
 # Build
-go build -o codefinder main.go
+go build -o codemap main.go
 
 # Run tests
 go test ./...
@@ -463,7 +463,7 @@ go vet ./...
 ### Project Structure
 
 ```
-codefinder/
+codemap/
 ├── main.go                 # Entry point, orchestrates components
 ├── go.mod                  # Go module definition
 ├── go.sum                  # Dependency checksums

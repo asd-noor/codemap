@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"codefinder/internal/db"
-	"codefinder/internal/graph"
-	"codefinder/internal/lsp"
-	"codefinder/internal/scanner"
+	"codemap/internal/db"
+	"codemap/internal/graph"
+	"codemap/internal/lsp"
+	"codemap/internal/scanner"
 )
 
 func TestIntegration_LSPEnrichmentWithAbsolutePaths(t *testing.T) {

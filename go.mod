@@ -1,4 +1,4 @@
-module codefinder
+module codemap
 
 go 1.25.6
 

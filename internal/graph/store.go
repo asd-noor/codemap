@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"codefinder/internal/db"
+	"codemap/internal/db"
 )
 
 type Store struct {

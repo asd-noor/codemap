@@ -9,13 +9,13 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"codefinder/internal/db"
-	"codefinder/internal/graph"
-	"codefinder/internal/lsp"
-	"codefinder/internal/scanner"
-	"codefinder/internal/server"
-	"codefinder/internal/watcher"
-	"codefinder/util"
+	"codemap/internal/db"
+	"codemap/internal/graph"
+	"codemap/internal/lsp"
+	"codemap/internal/scanner"
+	"codemap/internal/server"
+	"codemap/internal/watcher"
+	"codemap/util"
 )
 
 func main() {

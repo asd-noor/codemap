@@ -13,9 +13,9 @@ import (
 "github.com/fsnotify/fsnotify"
 ignore "github.com/sabhiram/go-gitignore"
 
-"codefinder/internal/graph"
-"codefinder/internal/lsp"
-"codefinder/internal/scanner"
+"codemap/internal/graph"
+"codemap/internal/lsp"
+"codemap/internal/scanner"
 )
 
 // Watcher monitors file system changes and triggers re-indexing.

@@ -6,9 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"codefinder/internal/db"
-	"codefinder/internal/graph"
-	"codefinder/internal/scanner"
+	"codemap/internal/db"
+	"codemap/internal/graph"
+	"codemap/internal/scanner"
 )
 
 func TestIntegration_ReindexAndQuery(t *testing.T) {

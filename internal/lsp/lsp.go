@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"codefinder/internal/graph"
-	"codefinder/util"
+	"codemap/internal/graph"
+	"codemap/util"
 )
 
 // Service manages LSP clients for different languages.

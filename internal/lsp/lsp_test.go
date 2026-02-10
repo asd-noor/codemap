@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"codefinder/internal/graph"
-	"codefinder/util"
+	"codemap/internal/graph"
+	"codemap/util"
 )
 
 func TestLSP_BasicWorkflow(t *testing.T) {
