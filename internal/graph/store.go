@@ -196,3 +196,39 @@ func (s *Store) Clear(ctx context.Context) error {
 	}
 	return nil
 }
+
+// PruneStaleFiles removes any files from the DB that were not found in the latest scan.
+func (s *Store) PruneStaleFiles(ctx context.Context, foundFilePaths []string) error {
+	// 1. Create a map for O(1) lookups of found files
+	keep := make(map[string]bool)
+	for _, p := range foundFilePaths {
+		keep[p] = true
+	}
+
+	// 2. Get all file paths currently in the DB
+	rows, err := s.db.QueryContext(ctx, "SELECT DISTINCT file_path FROM nodes")
+	if err != nil {
+		return fmt.Errorf("failed to query existing files: %w", err)
+	}
+	defer rows.Close()
+
+	var dbFiles []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return err
+		}
+		dbFiles = append(dbFiles, p)
+	}
+	rows.Close()
+
+	// 3. Delete files that are in DB but not in the found set
+	for _, file := range dbFiles {
+		if !keep[file] {
+			if err := s.DeleteNodesByFile(ctx, file); err != nil {
+				return fmt.Errorf("failed to prune stale file %s: %w", file, err)
+			}
+		}
+	}
+	return nil
+}

@@ -80,10 +80,25 @@ func main() {
 		log.Fatalf("Initial scan failed: %v", err)
 	}
 
+	// COLLECT VALID FILES
+	validFiles := make(map[string]bool)
+	var validFileList []string
+	for _, n := range nodes {
+		if !validFiles[n.FilePath] {
+			validFiles[n.FilePath] = true
+			validFileList = append(validFileList, n.FilePath)
+		}
+	}
+
 	for _, n := range nodes {
 		if err := store.UpsertNode(ctx, n); err != nil {
 			log.Printf("Failed to store node: %v", err)
 		}
+	}
+
+	// PRUNE STALE DATA
+	if err := store.PruneStaleFiles(ctx, validFileList); err != nil {
+		log.Printf("Warning: Failed to prune stale files: %v", err)
 	}
 
 	edges, err := lspSvc.Enrich(ctx, nodes)
