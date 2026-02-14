@@ -3,7 +3,6 @@ package scanner
 import (
 	"context"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,7 +36,9 @@ func New() (*Scanner, error) {
 	s.languages["go"] = sitter.NewLanguage(tsgo.Language())
 	s.languages["py"] = sitter.NewLanguage(tspy.Language())
 	s.languages["js"] = sitter.NewLanguage(tsjs.Language())
+	s.languages["jsx"] = sitter.NewLanguage(tsjs.Language())
 	s.languages["ts"] = sitter.NewLanguage(tsts.LanguageTypescript())
+	s.languages["tsx"] = sitter.NewLanguage(tsts.LanguageTSX())
 	s.languages["lua"] = sitter.NewLanguage(tslua.Language())
 	// Zig disabled for now
 
@@ -65,7 +66,11 @@ func getLangKey(ext string) string {
 		return "python"
 	case "js":
 		return "javascript"
+	case "jsx":
+		return "javascript"
 	case "ts":
+		return "typescript"
+	case "tsx":
 		return "typescript"
 	case "lua":
 		return "lua"
@@ -112,26 +117,41 @@ func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*graph.Node, err
 	defer qc.Close()
 
 	var nodes []*graph.Node
-	iter := qc.Captures(query, tree.RootNode(), content)
+	matches := qc.Matches(query, tree.RootNode(), content)
+	captureNames := query.CaptureNames()
+
 	for {
-		m, idx := iter.Next()
-		if idx == math.MaxUint {
+		match := matches.Next()
+		if match == nil {
 			break
 		}
 
-		for _, c := range m.Captures {
-			name := string(content[c.Node.StartByte():c.Node.EndByte()])
-			kind := query.CaptureNames()[c.Index]
+		var nameNode sitter.Node
+		var foundName bool
+		kind := "symbol"
+
+		for _, capture := range match.Captures {
+			if captureNames[capture.Index] == "name" {
+				nameNode = capture.Node
+				foundName = true
+			}
+		}
+
+		if foundName {
+			name := nameNode.Utf8Text(content)
+			if parentNode := nameNode.Parent(); parentNode != nil {
+				kind = parentNode.Kind()
+			}
 
 			nodes = append(nodes, &graph.Node{
 				ID:        util.GenerateNodeID(relPath, name),
 				Name:      name,
 				Kind:      kind,
 				FilePath:  path,
-				LineStart: int(c.Node.StartPosition().Row) + 1,
-				LineEnd:   int(c.Node.EndPosition().Row) + 1,
-				ColStart:  int(c.Node.StartPosition().Column) + 1,
-				ColEnd:    int(c.Node.EndPosition().Column) + 1,
+				LineStart: int(nameNode.StartPosition().Row) + 1,
+				LineEnd:   int(nameNode.EndPosition().Row) + 1,
+				ColStart:  int(nameNode.StartPosition().Column) + 1,
+				ColEnd:    int(nameNode.EndPosition().Column) + 1,
 				SymbolURI: util.PathToURI(path),
 			})
 		}

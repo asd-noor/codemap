@@ -79,6 +79,9 @@ That's it! CodeMap will:
 cd /path/to/your/project
 /path/to/codemap
 
+# Or override the project directory
+/path/to/codemap --project-dir /path/to/your/project
+
 # Or via mise
 mise run run
 

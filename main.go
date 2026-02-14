@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -19,6 +20,26 @@ import (
 )
 
 func main() {
+	projectDir := flag.String("project-dir", "", "Project directory to index (default: current working directory)")
+	flag.Parse()
+
+	if *projectDir != "" {
+		absProjectDir, err := filepath.Abs(*projectDir)
+		if err != nil {
+			log.Fatalf("Failed to resolve project directory: %v", err)
+		}
+		info, err := os.Stat(absProjectDir)
+		if err != nil {
+			log.Fatalf("Failed to access project directory: %v", err)
+		}
+		if !info.IsDir() {
+			log.Fatalf("Project directory is not a directory: %s", absProjectDir)
+		}
+		if err := os.Chdir(absProjectDir); err != nil {
+			log.Fatalf("Failed to change to project directory: %v", err)
+		}
+	}
+
 	// 1. Setup DB
 	// Try to find git root for project-specific DB
 	projectRoot, err := util.FindGitRoot()
