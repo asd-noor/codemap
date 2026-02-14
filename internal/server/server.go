@@ -69,10 +69,8 @@ func (s *Server) registerTools() {
 			return errorResult(fmt.Sprintf("Scan failed: %v", err)), nil, nil
 		}
 
-		for _, n := range nodes {
-			if err := s.store.UpsertNode(ctx, n); err != nil {
-				return errorResult(fmt.Sprintf("Failed to store node %s: %v", n.ID, err)), nil, nil
-			}
+		if err := s.store.BulkUpsertNodes(ctx, nodes); err != nil {
+			return errorResult(fmt.Sprintf("Failed to store nodes: %v", err)), nil, nil
 		}
 
 		edges, err := s.lsp.Enrich(ctx, nodes, s.store)
@@ -80,10 +78,8 @@ func (s *Server) registerTools() {
 			return errorResult(fmt.Sprintf("Enrich failed: %v", err)), nil, nil
 		}
 
-		for _, e := range edges {
-			if err := s.store.UpsertEdge(ctx, e); err != nil {
-				return errorResult(fmt.Sprintf("Failed to store edge: %v", err)), nil, nil
-			}
+		if err := s.store.BulkUpsertEdges(ctx, edges); err != nil {
+			return errorResult(fmt.Sprintf("Failed to store edges: %v", err)), nil, nil
 		}
 
 		msg := fmt.Sprintf("Indexed %d nodes and %d edges", len(nodes), len(edges))

@@ -182,10 +182,8 @@ func (w *Watcher) reindexFile(ctx context.Context, path string) error {
 		return fmt.Errorf("delete old nodes failed: %w", err)
 	}
 
-	for _, n := range nodes {
-		if err := w.store.UpsertNode(ctx, n); err != nil {
-			return fmt.Errorf("store node failed: %w", err)
-		}
+	if err := w.store.BulkUpsertNodes(ctx, nodes); err != nil {
+		return fmt.Errorf("bulk store nodes failed: %w", err)
 	}
 
 	edges, err := w.lsp.Enrich(ctx, nodes, w.store)
@@ -193,10 +191,8 @@ func (w *Watcher) reindexFile(ctx context.Context, path string) error {
 		log.Printf("LSP enrichment failed for %s: %v", path, err)
 	}
 
-	for _, e := range edges {
-		if err := w.store.UpsertEdge(ctx, e); err != nil {
-			log.Printf("Store edge failed: %v", err)
-		}
+	if err := w.store.BulkUpsertEdges(ctx, edges); err != nil {
+		return fmt.Errorf("bulk store edges failed: %w", err)
 	}
 
 	log.Printf("✓ Re-indexed %s: %d nodes, %d edges", filepath.Base(path), len(nodes), len(edges))

@@ -17,6 +17,10 @@ func NewStore(database *db.DB) *Store {
 }
 
 func (s *Store) UpsertNode(ctx context.Context, n *Node) error {
+	return s.upsertNode(ctx, s.db, n)
+}
+
+func (s *Store) upsertNode(ctx context.Context, execer db.Execer, n *Node) error {
 	query := `
 	INSERT INTO nodes (id, name, kind, file_path, line_start, line_end, col_start, col_end, symbol_uri)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -31,7 +35,7 @@ func (s *Store) UpsertNode(ctx context.Context, n *Node) error {
 		symbol_uri = excluded.symbol_uri,
 		created_at = CURRENT_TIMESTAMP;
 	`
-	_, err := s.db.ExecContext(ctx, query,
+	_, err := execer.ExecContext(ctx, query,
 		n.ID, n.Name, n.Kind, n.FilePath,
 		n.LineStart, n.LineEnd, n.ColStart, n.ColEnd, n.SymbolURI,
 	)
@@ -41,92 +45,91 @@ func (s *Store) UpsertNode(ctx context.Context, n *Node) error {
 	return nil
 }
 
+func (s *Store) BulkUpsertNodes(ctx context.Context, nodes []*Node) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, n := range nodes {
+		if err := s.upsertNode(ctx, tx, n); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
 func (s *Store) UpsertEdge(ctx context.Context, e *Edge) error {
+	return s.upsertEdge(ctx, s.db, e)
+}
+
+func (s *Store) upsertEdge(ctx context.Context, execer db.Execer, e *Edge) error {
 	query := `
 	INSERT INTO edges (source_id, target_id, relation)
 	VALUES (?, ?, ?)
 	ON CONFLICT(source_id, target_id, relation) DO NOTHING;
 	`
-	_, err := s.db.ExecContext(ctx, query, e.SourceID, e.TargetID, e.Relation)
+	_, err := execer.ExecContext(ctx, query, e.SourceID, e.TargetID, e.Relation)
 	if err != nil {
 		return fmt.Errorf("failed to upsert edge %s->%s: %w", e.SourceID, e.TargetID, err)
 	}
 	return nil
 }
 
-func (s *Store) FindImpact(ctx context.Context, symbolName string) ([]*Node, error) {
-	// First find IDs for the symbol name
-	rows, err := s.db.QueryContext(ctx, "SELECT id FROM nodes WHERE name = ?", symbolName)
+func (s *Store) BulkUpsertEdges(ctx context.Context, edges []*Edge) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to find symbol %s: %w", symbolName, err)
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, e := range edges {
+		if err := s.upsertEdge(ctx, tx, e); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+func (s *Store) FindImpact(ctx context.Context, symbolName string) ([]*Node, error) {
+	query := `
+	WITH RECURSIVE impacted AS (
+		-- Base case: Direct dependents (who calls/uses symbols with the given name)
+		SELECT source_id
+		FROM edges
+		WHERE target_id IN (SELECT id FROM nodes WHERE name = ?)
+		
+		UNION
+		
+		-- Recursive step: Dependents of dependents
+		SELECT e.source_id
+		FROM edges e
+		INNER JOIN impacted i ON e.target_id = i.source_id
+	)
+	SELECT DISTINCT n.id, n.name, n.kind, n.file_path, n.line_start, n.line_end, n.col_start, n.col_end, n.symbol_uri
+	FROM nodes n
+	JOIN impacted i ON n.id = i.source_id;
+	`
+
+	rows, err := s.db.QueryContext(ctx, query, symbolName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query impact for %s: %w", symbolName, err)
 	}
 	defer rows.Close()
 
-	var targetIDs []string
+	var nodes []*Node
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		n := &Node{}
+		if err := rows.Scan(&n.ID, &n.Name, &n.Kind, &n.FilePath, &n.LineStart, &n.LineEnd, &n.ColStart, &n.ColEnd, &n.SymbolURI); err != nil {
 			return nil, err
 		}
-		targetIDs = append(targetIDs, id)
-	}
-	rows.Close()
-
-	if len(targetIDs) == 0 {
-		return []*Node{}, nil
+		nodes = append(nodes, n)
 	}
 
-	// Build the recursive query
-	// Note: SQLite doesn't support arrays in queries easily, so we loop or build a big query.
-	// For MVP, finding impact for the first match or all matches combined?
-	// Let's combine them.
-
-	// Helper to fetch impacts for a single ID would be cleaner, but let's try to do it in one go or loop.
-	// Looping is safer for SQL injection prevention vs dynamic query building.
-
-	uniqueNodes := make(map[string]*Node)
-
-	for _, targetID := range targetIDs {
-		query := `
-		WITH RECURSIVE impacted AS (
-			-- Base case: Direct dependents (who calls/uses targetID)
-			SELECT source_id
-			FROM edges
-			WHERE target_id = ?
-			
-			UNION
-			
-			-- Recursive step: Dependents of dependents
-			SELECT e.source_id
-			FROM edges e
-			INNER JOIN impacted i ON e.target_id = i.source_id
-		)
-		SELECT DISTINCT n.id, n.name, n.kind, n.file_path, n.line_start, n.line_end, n.col_start, n.col_end, n.symbol_uri
-		FROM nodes n
-		JOIN impacted i ON n.id = i.source_id;
-		`
-
-		rows, err := s.db.QueryContext(ctx, query, targetID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to query impact for %s: %w", targetID, err)
-		}
-
-		for rows.Next() {
-			n := &Node{}
-			if err := rows.Scan(&n.ID, &n.Name, &n.Kind, &n.FilePath, &n.LineStart, &n.LineEnd, &n.ColStart, &n.ColEnd, &n.SymbolURI); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			uniqueNodes[n.ID] = n
-		}
-		rows.Close()
-	}
-
-	result := make([]*Node, 0, len(uniqueNodes))
-	for _, n := range uniqueNodes {
-		result = append(result, n)
-	}
-	return result, nil
+	return nodes, nil
 }
 
 func (s *Store) GetSymbolLocation(ctx context.Context, symbolName string) ([]*Node, error) {

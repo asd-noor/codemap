@@ -24,6 +24,7 @@ import (
 type Scanner struct {
 	languages map[string]*sitter.Language
 	queries   map[string]*sitter.Query
+	root      string
 }
 
 func New() (*Scanner, error) {
@@ -75,6 +76,13 @@ func getLangKey(ext string) string {
 
 // ScanFile scans a single file and returns its nodes.
 func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*graph.Node, error) {
+	relPath := path
+	if s.root != "" {
+		if rel, err := filepath.Rel(s.root, path); err == nil {
+			relPath = rel
+		}
+	}
+
 	ext := strings.TrimPrefix(filepath.Ext(path), ".")
 	lang, ok := s.languages[ext]
 	if !ok {
@@ -116,7 +124,7 @@ func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*graph.Node, err
 			kind := query.CaptureNames()[c.Index]
 
 			nodes = append(nodes, &graph.Node{
-				ID:        util.GenerateNodeID(path, name),
+				ID:        util.GenerateNodeID(relPath, name),
 				Name:      name,
 				Kind:      kind,
 				FilePath:  path,
@@ -133,6 +141,7 @@ func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*graph.Node, err
 }
 
 func (s *Scanner) Scan(ctx context.Context, root string) ([]*graph.Node, error) {
+	s.root = root
 	var nodes []*graph.Node
 
 	// Load gitignore

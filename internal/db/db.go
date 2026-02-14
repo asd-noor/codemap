@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -8,6 +9,11 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// Execer is an interface for types that can execute SQL queries.
+type Execer interface {
+	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
+}
 
 type DB struct {
 	*sql.DB

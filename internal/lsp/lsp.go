@@ -46,9 +46,15 @@ type Client struct {
 	stdout   *bufio.Reader
 	seq      int
 	mu       sync.Mutex
-	readMu   sync.Mutex     // Protects stdout reading from race conditions
+	pending  map[int]chan responseOrError
+	errChan  chan error
 	openDocs map[string]int // URI -> version
 	initTime time.Time      // When the server was initialized
+}
+
+type responseOrError struct {
+	data json.RawMessage
+	err  error
 }
 
 func (s *Service) getClient(lang string) *Client {
@@ -90,9 +96,14 @@ func (s *Service) StartClient(ctx context.Context, lang string, cmdPath string, 
 		stdin:    stdin,
 		stdout:   bufio.NewReader(stdout),
 		seq:      0,
+		pending:  make(map[int]chan responseOrError),
+		errChan:  make(chan error, 1),
 		openDocs: make(map[string]int),
 	}
 	s.clients[lang] = c
+
+	// Start background reader
+	go c.readLoop()
 
 	// Initialize Handshake
 	cwd, _ := os.Getwd()
@@ -136,7 +147,15 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params inte
 	c.mu.Lock()
 	c.seq++
 	id := c.seq
+	ch := make(chan responseOrError, 1)
+	c.pending[id] = ch
 	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+	}()
 
 	req := Request{
 		JSONRPC: "2.0",
@@ -149,56 +168,67 @@ func (c *Client) CallWithContext(ctx context.Context, method string, params inte
 		return nil, err
 	}
 
-	// Use a channel to receive the response
-	type result struct {
-		data json.RawMessage
-		err  error
-	}
-	resultCh := make(chan result, 1)
-
-	go func() {
-		// Lock stdout reading to prevent race conditions
-		c.readMu.Lock()
-		defer c.readMu.Unlock()
-
-		for {
-			msgBytes, err := ReadMessage(c.stdout)
-			if err != nil {
-				resultCh <- result{err: err}
-				return
-			}
-
-			// Try to decode as Response
-			var resp Response
-			if err := json.Unmarshal(msgBytes, &resp); err == nil {
-				if resp.ID == id {
-					if resp.Error != nil {
-						resultCh <- result{err: fmt.Errorf("RPC error %d: %s", resp.Error.Code, resp.Error.Message)}
-						return
-					}
-					var rawResp struct {
-						Result json.RawMessage `json:"result"`
-						Error  *RPCError       `json:"error"`
-						ID     int             `json:"id"`
-					}
-					if err := json.Unmarshal(msgBytes, &rawResp); err != nil {
-						resultCh <- result{err: err}
-						return
-					}
-					resultCh <- result{data: rawResp.Result}
-					return
-				}
-			}
-			// If ID doesn't match or not a response (notification), continue loop
-		}
-	}()
-
-	// Wait for response or timeout
+	// Wait for response, timeout, or server error
 	select {
-	case res := <-resultCh:
+	case res := <-ch:
 		return res.data, res.err
+	case err := <-c.errChan:
+		return nil, fmt.Errorf("LSP server error: %w", err)
 	case <-ctx.Done():
 		return nil, fmt.Errorf("LSP call timeout: %w", ctx.Err())
+	}
+}
+
+func (c *Client) readLoop() {
+	for {
+		msgBytes, err := ReadMessage(c.stdout)
+		if err != nil {
+			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
+				log.Printf("LSP read error: %v", err)
+				select {
+				case c.errChan <- err:
+				default:
+				}
+			}
+			return
+		}
+
+		// Try to decode as Response
+		var rawResp struct {
+			Result json.RawMessage `json:"result"`
+			Error  *RPCError       `json:"error"`
+			ID     interface{}     `json:"id"`
+		}
+
+		if err := json.Unmarshal(msgBytes, &rawResp); err == nil {
+			// LSP IDs can be int or string
+			var id int
+			var idSet bool
+
+			switch v := rawResp.ID.(type) {
+			case float64:
+				id = int(v)
+				idSet = true
+			case int:
+				id = v
+				idSet = true
+			}
+
+			if idSet {
+				c.mu.Lock()
+				ch, ok := c.pending[id]
+				c.mu.Unlock()
+
+				if ok {
+					var resErr error
+					if rawResp.Error != nil {
+						resErr = fmt.Errorf("RPC error %d: %s", rawResp.Error.Code, rawResp.Error.Message)
+					}
+					ch <- responseOrError{data: rawResp.Result, err: resErr}
+				}
+			}
+		}
+		// Notifications (no ID) or unrecognized messages are ignored for now
 	}
 }
 
@@ -375,7 +405,6 @@ type NodeResolver interface {
 // Enrich uses LSP to find cross-file references and generate edges.
 // Returns edges and statistics about the enrichment process.
 func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node, resolver NodeResolver) ([]*graph.Edge, error) {
-	var edges []*graph.Edge
 	stats := &EnrichmentStats{
 		LanguageServers: make(map[string]bool),
 		Errors:          []string{},
@@ -385,7 +414,7 @@ func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node, resolver Node
 	requiredLangs := s.detectRequiredLanguages(nodes)
 	if len(requiredLangs) == 0 {
 		log.Printf("No supported languages detected")
-		return edges, nil
+		return nil, nil
 	}
 
 	// Validate that language servers are installed
@@ -404,14 +433,10 @@ func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node, resolver Node
 	// Wait adaptively for indexing - only blocks if servers just started
 	s.waitForIndexing(langServers)
 
-	// Group nodes by file for document opening
-	fileMap := make(map[string][]*graph.Node)
-	for _, n := range nodes {
-		fileMap[n.FilePath] = append(fileMap[n.FilePath], n)
-	}
-
 	// Open documents in LSP
 	openedDocs := make(map[string]bool)
+	var docsMu sync.Mutex
+
 	defer func() {
 		// Close all opened documents
 		for uri := range openedDocs {
@@ -421,70 +446,86 @@ func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node, resolver Node
 		}
 	}()
 
-	// Process each node to find edges
+	// Use a worker pool for enrichment
+	const numWorkers = 10
+	nodeChan := make(chan *graph.Node, len(nodes))
+	edgeChan := make(chan []*graph.Edge, len(nodes))
+	var wg sync.WaitGroup
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := range nodeChan {
+				lang := getLang(n.FilePath)
+				client := s.getClient(lang)
+				if client == nil {
+					continue
+				}
+
+				// Ensure document is open
+				uri := util.PathToURI(n.FilePath)
+				docsMu.Lock()
+				isOpen := openedDocs[uri]
+				if !isOpen {
+					text, err := os.ReadFile(n.FilePath)
+					if err != nil {
+						errMsg := fmt.Sprintf("Failed to read file %s: %v", n.FilePath, err)
+						log.Println(errMsg)
+						docsMu.Unlock()
+						continue
+					}
+
+					langID := getLanguageID(lang)
+					if err := client.DidOpen(ctx, uri, langID, string(text)); err != nil {
+						errMsg := fmt.Sprintf("Failed to open document %s: %v", uri, err)
+						log.Println(errMsg)
+						docsMu.Unlock()
+						continue
+					}
+					openedDocs[uri] = true
+				}
+				docsMu.Unlock()
+
+				// Only process definitions (functions, classes, methods)
+				if n.Name == "" || !isDefinitionKind(n.Kind) {
+					continue
+				}
+
+				var nodeEdges []*graph.Edge
+				// Find references to this symbol
+				refEdges := s.findReferenceEdges(ctx, client, n, resolver)
+				nodeEdges = append(nodeEdges, refEdges...)
+
+				// Find implementations if this is an interface
+				if isInterfaceKind(n.Kind) {
+					implEdges := s.findImplementationEdges(ctx, client, n, resolver)
+					nodeEdges = append(nodeEdges, implEdges...)
+				}
+				edgeChan <- nodeEdges
+			}
+		}()
+	}
+
+	// Feed workers
 	for _, n := range nodes {
-		lang := getLang(n.FilePath)
-		client := s.getClient(lang)
-		if client == nil {
-			continue
-		}
+		nodeChan <- n
+	}
+	close(nodeChan)
 
-		// Ensure document is open
-		uri := util.PathToURI(n.FilePath)
-		if !openedDocs[uri] {
-			text, err := os.ReadFile(n.FilePath)
-			if err != nil {
-				errMsg := fmt.Sprintf("Failed to read file %s: %v", n.FilePath, err)
-				log.Println(errMsg)
-				stats.Errors = append(stats.Errors, errMsg)
-				stats.FilesSkipped++
-				continue
-			}
+	// Collect results
+	go func() {
+		wg.Wait()
+		close(edgeChan)
+	}()
 
-			langID := getLanguageID(lang)
-			if err := client.DidOpen(ctx, uri, langID, string(text)); err != nil {
-				errMsg := fmt.Sprintf("Failed to open document %s: %v", uri, err)
-				log.Println(errMsg)
-				stats.Errors = append(stats.Errors, errMsg)
-				stats.FilesSkipped++
-				continue
-			}
-			openedDocs[uri] = true
-			stats.FilesProcessed++
-		}
-
-		// Only process definitions (functions, classes, methods)
-		if n.Name == "" || !isDefinitionKind(n.Kind) {
-			continue
-		}
-
-		// Find references to this symbol
-		refEdges := s.findReferenceEdges(ctx, client, n, resolver)
-		edges = append(edges, refEdges...)
-
-		// Find implementations if this is an interface
-		if isInterfaceKind(n.Kind) {
-			implEdges := s.findImplementationEdges(ctx, client, n, resolver)
-			edges = append(edges, implEdges...)
-		}
+	var edges []*graph.Edge
+	for eList := range edgeChan {
+		edges = append(edges, eList...)
 	}
 
 	stats.EdgesGenerated = len(edges)
-
-	// Log summary
-	log.Printf("Enrichment complete: %d files processed, %d skipped, %d edges generated, %d errors",
-		stats.FilesProcessed, stats.FilesSkipped, stats.EdgesGenerated, len(stats.Errors))
-
-	if len(stats.Errors) > 0 && len(stats.Errors) <= 5 {
-		for _, errMsg := range stats.Errors {
-			log.Printf("  Error: %s", errMsg)
-		}
-	} else if len(stats.Errors) > 5 {
-		log.Printf("  (showing first 5 of %d errors)", len(stats.Errors))
-		for i := 0; i < 5; i++ {
-			log.Printf("  Error: %s", stats.Errors[i])
-		}
-	}
+	log.Printf("Enrichment complete: %d edges generated", len(edges))
 
 	return edges, nil
 }
@@ -574,7 +615,7 @@ func (s *Service) validateLanguageServers(requiredLangs map[string]bool) error {
 // waitForIndexing waits adaptively for language servers to index.
 // Only waits if servers were recently started; skips if already had time.
 func (s *Service) waitForIndexing(langServers map[string]bool) {
-	const minIndexTime = 2 * time.Second // Minimum time for indexing
+	const minIndexTime = 5 * time.Second // Increased for reliability
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

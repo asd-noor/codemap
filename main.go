@@ -90,10 +90,8 @@ func main() {
 		}
 	}
 
-	for _, n := range nodes {
-		if err := store.UpsertNode(ctx, n); err != nil {
-			log.Printf("Failed to store node: %v", err)
-		}
+	if err := store.BulkUpsertNodes(ctx, nodes); err != nil {
+		log.Printf("Failed to store nodes: %v", err)
 	}
 
 	// PRUNE STALE DATA
@@ -106,10 +104,8 @@ func main() {
 		log.Fatalf("LSP enrichment failed: %v", err)
 	}
 
-	for _, e := range edges {
-		if err := store.UpsertEdge(ctx, e); err != nil {
-			log.Printf("Failed to store edge: %v", err)
-		}
+	if err := store.BulkUpsertEdges(ctx, edges); err != nil {
+		log.Printf("Failed to store edges: %v", err)
 	}
 
 	log.Printf("Initial index complete: %d nodes, %d edges", len(nodes), len(edges))
