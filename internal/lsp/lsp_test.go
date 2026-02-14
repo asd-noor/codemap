@@ -101,6 +101,29 @@ func Helper() {
 	client.DidClose(ctx, mainURI)
 }
 
+// MockNodeResolver implements NodeResolver for testing
+type MockNodeResolver struct {
+	nodes []*graph.Node
+}
+
+func (m *MockNodeResolver) FindNode(ctx context.Context, path string, line, col int) (*graph.Node, error) {
+	var best *graph.Node
+	for _, n := range m.nodes {
+		if n.FilePath == path {
+			if n.LineStart <= line && n.LineEnd >= line {
+				if best == nil {
+					best = n
+				} else {
+					if n.LineStart >= best.LineStart && n.LineEnd <= best.LineEnd {
+						best = n
+					}
+				}
+			}
+		}
+	}
+	return best, nil
+}
+
 func TestLSP_Enrich(t *testing.T) {
 	// Skip if gopls is not available
 	if !isCommandAvailable("gopls") {
@@ -161,8 +184,10 @@ func Helper() {}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
+	resolver := &MockNodeResolver{nodes: nodes}
+
 	// Run enrichment
-	edges, err := svc.Enrich(ctx, nodes)
+	edges, err := svc.Enrich(ctx, nodes, resolver)
 	if err != nil {
 		t.Fatalf("Enrich failed: %v", err)
 	}
@@ -237,56 +262,3 @@ func TestIsInterfaceKind(t *testing.T) {
 	}
 }
 
-func TestFindNodeContaining(t *testing.T) {
-	nodes := []*graph.Node{
-		{
-			ID:        "file1:FuncA",
-			FilePath:  "/test/file1.go",
-			LineStart: 1,
-			LineEnd:   10,
-		},
-		{
-			ID:        "file1:FuncB",
-			FilePath:  "/test/file1.go",
-			LineStart: 5,
-			LineEnd:   8,
-		},
-		{
-			ID:        "file2:FuncC",
-			FilePath:  "/test/file2.go",
-			LineStart: 1,
-			LineEnd:   5,
-		},
-	}
-
-	tests := []struct {
-		name     string
-		filePath string
-		line     int
-		col      int
-		wantID   string
-	}{
-		{"top of FuncA", "/test/file1.go", 2, 1, "file1:FuncA"},
-		{"inside FuncB (nested)", "/test/file1.go", 6, 1, "file1:FuncB"},
-		{"in FuncC", "/test/file2.go", 3, 1, "file2:FuncC"},
-		{"no match", "/test/file3.go", 1, 1, ""},
-		{"outside range", "/test/file1.go", 15, 1, ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := findNodeContaining(nodes, tt.filePath, tt.line, tt.col)
-			if tt.wantID == "" {
-				if got != nil {
-					t.Errorf("Expected nil, got %v", got)
-				}
-			} else {
-				if got == nil {
-					t.Errorf("Expected node with ID %s, got nil", tt.wantID)
-				} else if got.ID != tt.wantID {
-					t.Errorf("Expected node ID %s, got %s", tt.wantID, got.ID)
-				}
-			}
-		})
-	}
-}

@@ -2,6 +2,7 @@ package graph
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"codemap/internal/db"
@@ -197,7 +198,27 @@ func (s *Store) Clear(ctx context.Context) error {
 	return nil
 }
 
-// PruneStaleFiles removes any files from the DB that were not found in the latest scan.
+// FindNode finds the smallest node containing the given position.
+func (s *Store) FindNode(ctx context.Context, path string, line, col int) (*Node, error) {
+	query := `
+	SELECT id, name, kind, file_path, line_start, line_end, col_start, col_end, symbol_uri
+	FROM nodes
+	WHERE file_path = ? AND line_start <= ? AND line_end >= ?
+	ORDER BY (line_end - line_start) ASC
+	LIMIT 1;
+	`
+	row := s.db.QueryRowContext(ctx, query, path, line, line)
+
+	n := &Node{}
+	if err := row.Scan(&n.ID, &n.Name, &n.Kind, &n.FilePath, &n.LineStart, &n.LineEnd, &n.ColStart, &n.ColEnd, &n.SymbolURI); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to find node at %s:%d: %w", path, line, err)
+	}
+	return n, nil
+}
+
 func (s *Store) PruneStaleFiles(ctx context.Context, foundFilePaths []string) error {
 	// 1. Create a map for O(1) lookups of found files
 	keep := make(map[string]bool)

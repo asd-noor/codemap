@@ -87,7 +87,7 @@ func Helper() {
 	lspSvc := lsp.NewService()
 	defer lspSvc.Shutdown()
 
-	edges, err := lspSvc.Enrich(context.Background(), nodes)
+	edges, err := lspSvc.Enrich(context.Background(), nodes, store)
 	if err != nil {
 		t.Fatalf("Enrich failed: %v", err)
 	}

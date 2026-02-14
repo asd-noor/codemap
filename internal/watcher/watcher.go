@@ -188,7 +188,7 @@ func (w *Watcher) reindexFile(ctx context.Context, path string) error {
 		}
 	}
 
-	edges, err := w.lsp.Enrich(ctx, nodes)
+	edges, err := w.lsp.Enrich(ctx, nodes, w.store)
 	if err != nil {
 		log.Printf("LSP enrichment failed for %s: %v", path, err)
 	}

@@ -101,7 +101,7 @@ func main() {
 		log.Printf("Warning: Failed to prune stale files: %v", err)
 	}
 
-	edges, err := lspSvc.Enrich(ctx, nodes)
+	edges, err := lspSvc.Enrich(ctx, nodes, store)
 	if err != nil {
 		log.Fatalf("LSP enrichment failed: %v", err)
 	}

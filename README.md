@@ -226,8 +226,8 @@ Find where a symbol is defined.
 │  ┌───────────────────────────────────────────────┐     │
 │  │          MCP Server (foreground)              │     │
 │  │  • JSON-RPC over stdio                        │     │
-│  │  • 4 tools: index, get_symbols, find_impact,  │     │
-│  │    get_location                               │     │
+│  │  • 4 tools: index, get_symbols_in_file,        │     │
+│  │    find_impact, get_symbol_location            │     │
 │  └───────────────────────────────────────────────┘     │
 │                                                         │
 └─────────────────────────────────────────────────────────┘
@@ -257,7 +257,7 @@ Find where a symbol is defined.
 - **Database:** SQLite with WAL mode
 - **Schema:** 
   - `nodes` - Code symbols (functions, classes, etc.)
-  - `edges` - Relationships (calls, implements, references)
+- `edges` - Relationships (implements, references)
 - **Queries:** Recursive CTEs for dependency traversal
 - **Indexing:** Optimized for file_path and symbol_name lookups
 
@@ -289,7 +289,7 @@ Find where a symbol is defined.
 {
   "source_id": "node_id_1",
   "target_id": "node_id_2",
-  "relation": "calls" | "implements" | "references" | "imports"
+  "relation": "implements" | "references"
 }
 ```
 
@@ -310,7 +310,7 @@ Find where a symbol is defined.
 - **OS:** Linux, macOS, or Windows
 - **RAM:** 100MB minimum
 - **Disk:** Varies by codebase size (SQLite database)
-- **Go:** 1.21+ (for building)
+- **Go:** 1.25.6+ (for building)
 
 ### Language Server Requirements
 
@@ -666,4 +666,3 @@ Built with:
 - [Model Context Protocol](https://modelcontextprotocol.io) - AI agent integration
 - [fsnotify](https://github.com/fsnotify/fsnotify) - File watching
 - [SQLite](https://www.sqlite.org/) - Graph storage
-

@@ -367,9 +367,14 @@ func (c *Client) GetDocumentSymbols(ctx context.Context, uri string) ([]Document
 	return symbols, nil
 }
 
+// NodeResolver is an interface to find nodes by location.
+type NodeResolver interface {
+	FindNode(ctx context.Context, path string, line, col int) (*graph.Node, error)
+}
+
 // Enrich uses LSP to find cross-file references and generate edges.
 // Returns edges and statistics about the enrichment process.
-func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node) ([]*graph.Edge, error) {
+func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node, resolver NodeResolver) ([]*graph.Edge, error) {
 	var edges []*graph.Edge
 	stats := &EnrichmentStats{
 		LanguageServers: make(map[string]bool),
@@ -454,12 +459,12 @@ func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node) ([]*graph.Edg
 		}
 
 		// Find references to this symbol
-		refEdges := s.findReferenceEdges(ctx, client, n, nodes)
+		refEdges := s.findReferenceEdges(ctx, client, n, resolver)
 		edges = append(edges, refEdges...)
 
 		// Find implementations if this is an interface
 		if isInterfaceKind(n.Kind) {
-			implEdges := s.findImplementationEdges(ctx, client, n, nodes)
+			implEdges := s.findImplementationEdges(ctx, client, n, resolver)
 			edges = append(edges, implEdges...)
 		}
 	}
@@ -599,7 +604,7 @@ func (s *Service) waitForIndexing(langServers map[string]bool) {
 }
 
 // findReferenceEdges finds all references to a symbol and creates edges.
-func (s *Service) findReferenceEdges(ctx context.Context, client *Client, n *graph.Node, allNodes []*graph.Node) []*graph.Edge {
+func (s *Service) findReferenceEdges(ctx context.Context, client *Client, n *graph.Node, resolver NodeResolver) []*graph.Edge {
 	var edges []*graph.Edge
 
 	uri := util.PathToURI(n.FilePath)
@@ -611,7 +616,11 @@ func (s *Service) findReferenceEdges(ctx context.Context, client *Client, n *gra
 
 	for _, loc := range locs {
 		targetPath := util.URIToPath(loc.URI)
-		sourceNode := findNodeContaining(allNodes, targetPath, loc.Range.Start.Line+1, loc.Range.Start.Character+1)
+		// Look up the node that contains this reference (the caller)
+		sourceNode, err := resolver.FindNode(ctx, targetPath, loc.Range.Start.Line+1, loc.Range.Start.Character+1)
+		if err != nil {
+			continue // Skip if lookup fails
+		}
 
 		if sourceNode != nil && sourceNode.ID != n.ID {
 			edges = append(edges, &graph.Edge{
@@ -626,7 +635,7 @@ func (s *Service) findReferenceEdges(ctx context.Context, client *Client, n *gra
 }
 
 // findImplementationEdges finds implementations of an interface.
-func (s *Service) findImplementationEdges(ctx context.Context, client *Client, n *graph.Node, allNodes []*graph.Node) []*graph.Edge {
+func (s *Service) findImplementationEdges(ctx context.Context, client *Client, n *graph.Node, resolver NodeResolver) []*graph.Edge {
 	var edges []*graph.Edge
 
 	uri := util.PathToURI(n.FilePath)
@@ -637,7 +646,10 @@ func (s *Service) findImplementationEdges(ctx context.Context, client *Client, n
 
 	for _, loc := range locs {
 		targetPath := util.URIToPath(loc.URI)
-		implNode := findNodeContaining(allNodes, targetPath, loc.Range.Start.Line+1, loc.Range.Start.Character+1)
+		implNode, err := resolver.FindNode(ctx, targetPath, loc.Range.Start.Line+1, loc.Range.Start.Character+1)
+		if err != nil {
+			continue
+		}
 
 		if implNode != nil && implNode.ID != n.ID {
 			edges = append(edges, &graph.Edge{
@@ -778,26 +790,3 @@ func isInterfaceKind(kind string) bool {
 	return kind == "interface_declaration" || kind == "protocol_declaration"
 }
 
-func findNodeContaining(nodes []*graph.Node, filePath string, line, col int) *graph.Node {
-	// Linear search is slow but fine for MVP
-	var best *graph.Node
-	for _, n := range nodes {
-		if n.FilePath == filePath {
-			// Check if range contains line/col
-			if n.LineStart <= line && n.LineEnd >= line {
-				// Simple containment
-				// We want the *smallest* node containing it (e.g. method inside class)
-				// If we find a match, check if it's "smaller" (or deeper) than current best
-				if best == nil {
-					best = n
-				} else {
-					// If n is inside best, n is better
-					if n.LineStart >= best.LineStart && n.LineEnd <= best.LineEnd {
-						best = n
-					}
-				}
-			}
-		}
-	}
-	return best
-}

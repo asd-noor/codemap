@@ -75,7 +75,7 @@ func (s *Server) registerTools() {
 			}
 		}
 
-		edges, err := s.lsp.Enrich(ctx, nodes)
+		edges, err := s.lsp.Enrich(ctx, nodes, s.store)
 		if err != nil {
 			return errorResult(fmt.Sprintf("Enrich failed: %v", err)), nil, nil
 		}
