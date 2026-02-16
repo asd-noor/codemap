@@ -109,44 +109,24 @@ func main() {
 		log.Fatalf("Failed to get working directory: %v", err)
 	}
 
-	// 6. Run initial index
-	log.Printf("Indexing workspace: %s", cwd)
-	nodes, err := scn.Scan(ctx, cwd)
-	if err != nil {
-		log.Fatalf("Initial scan failed: %v", err)
-	}
+	// 6. Start MCP Server
+	srv := server.New(scn, store, lspSvc, systemPrompt)
 
-	// COLLECT VALID FILES
-	validFiles := make(map[string]bool)
-	var validFileList []string
-	for _, n := range nodes {
-		if !validFiles[n.FilePath] {
-			validFiles[n.FilePath] = true
-			validFileList = append(validFileList, n.FilePath)
+	log.Println("Starting MCP server on stdio...")
+
+	// 7. Run initial index in background
+	go func() {
+		log.Printf("Starting background indexing of workspace: %s", cwd)
+		srv.RunInitialIndex(ctx, cwd)
+		status, indexErr, duration := srv.GetIndexStatus()
+		if indexErr != nil {
+			log.Printf("Background indexing failed after %.2fs: %v", duration.Seconds(), indexErr)
+		} else if status == "ready" {
+			log.Printf("Background indexing completed successfully in %.2fs", duration.Seconds())
 		}
-	}
+	}()
 
-	if err := store.BulkUpsertNodes(ctx, nodes); err != nil {
-		log.Printf("Failed to store nodes: %v", err)
-	}
-
-	// PRUNE STALE DATA
-	if err := store.PruneStaleFiles(ctx, validFileList); err != nil {
-		log.Printf("Warning: Failed to prune stale files: %v", err)
-	}
-
-	edges, err := lspSvc.Enrich(ctx, nodes, store)
-	if err != nil {
-		log.Fatalf("LSP enrichment failed: %v", err)
-	}
-
-	if err := store.BulkUpsertEdges(ctx, edges); err != nil {
-		log.Printf("Failed to store edges: %v", err)
-	}
-
-	log.Printf("Initial index complete: %d nodes, %d edges", len(nodes), len(edges))
-
-	// 7. Start file watcher in background
+	// 8. Start file watcher in background
 	w, err := watcher.New(scn, store, lspSvc, cwd)
 	if err != nil {
 		log.Fatalf("Failed to create watcher: %v", err)
@@ -163,10 +143,8 @@ func main() {
 		}
 	}()
 
-	// 8. Start MCP Server (blocks until shutdown)
-	srv := server.New(scn, store, lspSvc, systemPrompt)
-
-	log.Println("Starting MCP server on stdio...")
+	// 9. Run MCP Server (blocks until shutdown)
+	log.Println("MCP server ready to accept connections")
 
 	// Run server in goroutine so we can handle watcher errors
 	serverErrChan := make(chan error, 1)

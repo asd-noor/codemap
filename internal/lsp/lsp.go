@@ -652,10 +652,10 @@ func (s *Service) waitForIndexing(langServers map[string]bool) {
 	elapsed := time.Since(newestInitTime)
 	if elapsed < minIndexTime {
 		waitTime := minIndexTime - elapsed
-		log.Printf("Waiting %.1fs for language servers to index workspace...", waitTime.Seconds())
+		log.Printf("[Background] Waiting %.1fs for language servers to index workspace...", waitTime.Seconds())
 		time.Sleep(waitTime)
 	} else {
-		log.Printf("Language servers already had %.1fs to index, proceeding immediately", elapsed.Seconds())
+		log.Printf("[Background] Language servers already had %.1fs to index, proceeding immediately", elapsed.Seconds())
 	}
 }
 
