@@ -25,6 +25,7 @@ CodeMap is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) ser
 🔍 **AI-Friendly**
 - MCP protocol for seamless AI agent integration
 - 4 powerful tools for code analysis
+- 4 specialized prompts for common tasks
 - Always up-to-date graph (auto re-indexes on save)
 
 ## Quick Start
@@ -214,13 +215,35 @@ Find where a symbol is defined.
 ]
 ```
 
+### Available Resources
+
+#### `mcp://usage-guidelines`
+A markdown resource containing the system prompt and operating instructions for AI agents using CodeMap. This is automatically provided to agents to improve their decision-making.
+
+### Available Prompts
+
+#### 1. `analyze-impact`
+Guides the agent to analyze the "blast radius" of changing a symbol.
+- **Arguments:** `symbol_name`
+
+#### 2. `explore-file`
+Guides the agent to understand the internal structure of a specific file.
+- **Arguments:** `file_path`
+
+#### 3. `locate-and-explain`
+Guides the agent to find a symbol and explain its context in its source file.
+- **Arguments:** `symbol_name`
+
+#### 4. `re-index-workspace`
+Directs the agent to refresh the semantic graph.
+
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     CodeMap                          │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
+┌────────────────────────────────────────────────────────┐
+│                     CodeMap                            │
+├────────────────────────────────────────────────────────┤
+│                                                        │
 │  ┌───────────────────────────────────────────────┐     │
 │  │              Initial Index                    │     │
 │  │  • Scan workspace with tree-sitter            │     │
@@ -228,22 +251,25 @@ Find where a symbol is defined.
 │  │  • LSP enrichment (cross-file references)     │     │
 │  │  • Store edges (relationships)                │     │
 │  └───────────────────────────────────────────────┘     │
-│                       ↓                                 │
+│                       ↓                                │
 │  ┌───────────────────────────────────────────────┐     │
 │  │         File Watcher (background)             │     │
 │  │  • Monitor file changes (fsnotify)            │     │
 │  │  • Debounce (500ms)                           │     │
 │  │  • Incremental re-index on save               │     │
 │  └───────────────────────────────────────────────┘     │
-│                       ↓                                 │
+│                       ↓                                │
 │  ┌───────────────────────────────────────────────┐     │
 │  │          MCP Server (foreground)              │     │
 │  │  • JSON-RPC over stdio                        │     │
-│  │  • 4 tools: index, get_symbols_in_file,        │     │
-│  │    find_impact, get_symbol_location            │     │
+│  │  • 4 tools: index, get_symbols_in_file,       │     │
+│  │    find_impact, get_symbol_location           │     │
+│  │  • 4 prompts: analyze-impact, explore-file,   │     │
+│  │    locate-and-explain, re-index-workspace     │     │
+│  │  • 1 resource: mcp://usage-guidelines         │     │
 │  └───────────────────────────────────────────────┘     │
-│                                                         │
-└─────────────────────────────────────────────────────────┘
+│                                                        │
+└────────────────────────────────────────────────────────┘
           ↓                    ↓                    ↓
     ┌──────────┐        ┌──────────┐        ┌──────────┐
     │ Scanner  │        │   LSP    │        │  Store   │
@@ -490,6 +516,7 @@ go vet ./...
 ```
 codemap/
 ├── main.go                 # Entry point, orchestrates components
+├── SYSTEM_PROMPT.md        # System guidelines (embedded as MCP resource)
 ├── go.mod                  # Go module definition
 ├── go.sum                  # Dependency checksums
 ├── mise.toml               # Task runner configuration
@@ -507,7 +534,10 @@ codemap/
 │   │   ├── scanner.go      # File scanning, node extraction
 │   │   └── queries.go      # Tree-sitter query definitions
 │   ├── server/             # MCP server implementation
-│   │   └── server.go       # Tool registration and handlers
+│   │   ├── server.go       # Core server logic
+│   │   ├── tools.go        # Tool registration
+│   │   ├── resources.go    # Resource registration
+│   │   └── prompts.go      # Prompt registration
 │   └── watcher/            # File system monitoring
 │       └── watcher.go      # fsnotify integration, debouncing
 ├── util/                   # Utility functions

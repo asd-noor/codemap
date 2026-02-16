@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"flag"
 	"fmt"
 	"log"
@@ -18,6 +19,9 @@ import (
 	"codemap/internal/watcher"
 	"codemap/util"
 )
+
+//go:embed SYSTEM_PROMPT.md
+var systemPrompt string
 
 func main() {
 	projectDir := flag.String("project-dir", "", "Project directory to index (default: current working directory)")
@@ -160,7 +164,7 @@ func main() {
 	}()
 
 	// 8. Start MCP Server (blocks until shutdown)
-	srv := server.New(scn, store, lspSvc)
+	srv := server.New(scn, store, lspSvc, systemPrompt)
 
 	log.Println("Starting MCP server on stdio...")
 
