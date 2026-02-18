@@ -33,7 +33,9 @@ CodeMap is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) ser
 ### Prerequisites
 
 1. Install [mise-en-place](https://mise.jdx.dev/) (recommended for managing tools and tasks).
-2. Install language servers for the languages you use:
+2. **Language servers are auto-downloaded** - CodeMap will automatically download and cache LSP servers when needed. No manual installation required!
+
+**Optional:** If you prefer to use your own LSP installations, you can install them manually:
 
 ```bash
 # Go
@@ -51,6 +53,8 @@ brew install lua-language-server
 # Zig (macOS)
 brew install zls
 ```
+
+CodeMap will automatically detect and use system-installed language servers before downloading.
 
 ### Installation
 
@@ -70,9 +74,10 @@ go build -o codemap main.go
 ```
 
 That's it! CodeMap will:
-1. Index your workspace (1-2 seconds)
-2. Start watching for file changes
-3. Launch the MCP server on stdio
+1. Auto-download any missing LSP servers (on first use)
+2. Index your workspace (1-2 seconds)
+3. Start watching for file changes
+4. Launch the MCP server on stdio
 
 ## Usage
 
@@ -295,7 +300,8 @@ Directs the agent to refresh the semantic graph.
 - **Purpose:** Resolve cross-file references and relationships
 - **Servers:** gopls, pyright, typescript-language-server, lua-language-server, zls
 - **Features:** Definition lookup, implementation tracking, reference finding
-- **Validation:** Hard requirement - fails fast if servers missing
+- **Auto-Download:** Automatically downloads missing LSP servers to `~/.cache/codemap/lsp/`
+- **Priority:** Custom paths (flags) → System PATH → Auto-download
 
 #### Graph Store
 - **Database:** SQLite with WAL mode
@@ -358,7 +364,11 @@ Directs the agent to refresh the semantic graph.
 
 ### Language Server Requirements
 
-CodeMap **requires** language servers to be installed:
+CodeMap **automatically downloads** missing language servers on first use. No manual installation required!
+
+Downloaded binaries are stored in `~/.cache/codemap/lsp/` and don't pollute your system PATH.
+
+**Optional manual installation:**
 
 | Language | Server | Installation |
 |----------|--------|--------------|
@@ -367,6 +377,8 @@ CodeMap **requires** language servers to be installed:
 | JavaScript/TypeScript | typescript-language-server | `npm install -g typescript-language-server typescript` |
 | Lua | lua-language-server | `brew install lua-language-server` |
 | Zig | zls | `brew install zls` |
+
+**Priority order:** Custom paths (via flags) → System PATH → Auto-download
 
 ### Language Feature Status
 
@@ -676,6 +688,58 @@ A: Yes! The SQLite database persists in `.ctxhub/codemap.sqlite`.
 
 **Q: How do I reset the graph?**  
 A: Delete the database: `rm -rf .ctxhub/` and restart CodeMap.
+
+## Troubleshooting
+
+### LSP Server Issues
+
+**Problem:** LSP server download fails
+
+```
+Failed to download gopls: download failed after 3 attempts
+```
+
+**Solutions:**
+1. Check network connectivity
+2. Verify disk space: `df -h ~/.cache/codemap/lsp/`
+3. Set custom cache directory: `export CODEMAP_CACHE_DIR=/custom/path`
+4. Install manually and use system PATH
+
+**Problem:** Permission denied on cache directory
+
+```
+Failed to create version dir: permission denied
+```
+
+**Solutions:**
+1. Fix permissions: `chmod -R 755 ~/.cache/codemap/`
+2. Set alternative cache: `export CODEMAP_CACHE_DIR=$HOME/codemap-cache`
+3. Use custom LSP paths: `--gopls-path /your/gopls`
+
+### Cache Management
+
+**View downloaded LSP servers:**
+```bash
+ls -lh ~/.cache/codemap/lsp/
+```
+
+**Clear cache to force re-download:**
+```bash
+rm -rf ~/.cache/codemap/lsp/
+```
+
+**Check which LSP is being used:**
+```bash
+# Look for log messages like:
+# [go] Using system LSP: /usr/local/bin/gopls
+# [python] Using cached LSP: ~/.cache/codemap/lsp/python/1.1.390/pyright-langserver
+# [typescript] LSP not found, downloading...
+```
+
+### Environment Variables
+
+- `CODEMAP_CACHE_DIR` - Override cache directory location
+- `XDG_CACHE_HOME` - Standard cache directory (Unix-like systems)
 
 ## Limitations
 

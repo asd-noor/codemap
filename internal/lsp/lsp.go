@@ -13,15 +13,17 @@ import (
 	"sync"
 	"time"
 
+	"codemap/internal/downloader"
 	"codemap/internal/graph"
 	"codemap/util"
 )
 
 // Service manages LSP clients for different languages.
 type Service struct {
-	clients map[string]*Client
-	mu      sync.Mutex
-	config  ServiceConfig
+	clients    map[string]*Client
+	mu         sync.Mutex
+	config     ServiceConfig
+	downloader *downloader.Downloader
 }
 
 // ServiceConfig allows overriding language server command paths.
@@ -47,9 +49,15 @@ func NewService() *Service {
 }
 
 func NewServiceWithConfig(config ServiceConfig) *Service {
+	dl, err := downloader.New()
+	if err != nil {
+		log.Printf("Warning: Failed to initialize downloader: %v", err)
+		log.Println("LSP auto-download will not be available")
+	}
 	return &Service{
-		clients: make(map[string]*Client),
-		config:  config,
+		clients:    make(map[string]*Client),
+		config:     config,
+		downloader: dl,
 	}
 }
 
@@ -556,11 +564,17 @@ func (s *Service) detectAndStartLanguageServers(ctx context.Context, nodes []*gr
 
 	started := make(map[string]bool)
 	for lang := range langSet {
-		cmdPath, args := s.getLanguageServerCommand(lang)
-		if cmdPath == "" {
+		// Get custom path for this language
+		customPath := s.getCustomPath(lang)
+		
+		// Ensure LSP is available (custom → system → download)
+		cmdPath, err := s.ensureLSPAvailable(ctx, lang, customPath)
+		if err != nil {
+			log.Printf("Warning: Failed to get %s language server: %v", lang, err)
 			continue
 		}
 
+		args := s.getLanguageServerArgs(lang)
 		if err := s.StartClient(ctx, lang, cmdPath, args); err != nil {
 			log.Printf("Warning: Failed to start %s language server: %v", lang, err)
 		} else {
@@ -584,46 +598,10 @@ func (s *Service) detectRequiredLanguages(nodes []*graph.Node) map[string]bool {
 	return langSet
 }
 
-// validateLanguageServers checks if required language servers are installed.
+// validateLanguageServers is now deprecated - we auto-download instead.
+// Kept for backwards compatibility but returns nil.
 func (s *Service) validateLanguageServers(requiredLangs map[string]bool) error {
-	var missing []string
-	var instructions []string
-
-	for lang := range requiredLangs {
-		cmdPath, _ := s.getLanguageServerCommand(lang)
-		if cmdPath == "" {
-			continue // Language not supported, skip
-		}
-
-		if !isCommandAvailable(cmdPath) {
-			missing = append(missing, lang)
-			if instruction := getLanguageServerInstallInstructions(lang); instruction != "" {
-				instructions = append(instructions, fmt.Sprintf("  %s: %s", lang, instruction))
-			}
-		}
-	}
-
-	if len(missing) > 0 {
-		var firstCmd string
-		if cmdPath, _ := s.getLanguageServerCommand(missing[0]); cmdPath != "" {
-			firstCmd = cmdPath
-		} else {
-			firstCmd = "gopls"
-		}
-
-		errorMsg := fmt.Sprintf(
-			"❌ Language server(s) not found: %v\n\n"+
-				"CodeFinder requires LSP servers for dependency analysis.\n"+
-				"Without them, find_impact tool will not work.\n\n"+
-				"Install missing servers:\n%s\n\n"+
-				"After installation, verify with: which %s",
-			missing,
-			strings.Join(instructions, "\n"),
-			firstCmd,
-		)
-		return fmt.Errorf("%s", errorMsg)
-	}
-
+	// Auto-download will handle missing servers, no need to fail here
 	return nil
 }
 
@@ -843,6 +821,57 @@ func getLanguageServerInstallInstructions(lang string) string {
 	default:
 		return ""
 	}
+}
+
+// getCustomPath returns the custom path for a language from config (if set).
+func (s *Service) getCustomPath(lang string) string {
+	switch lang {
+	case "go":
+		return strings.TrimSpace(s.config.GoPath)
+	case "python":
+		return strings.TrimSpace(s.config.PythonPath)
+	case "javascript", "typescript":
+		return strings.TrimSpace(s.config.TypeScriptPath)
+	case "lua":
+		return strings.TrimSpace(s.config.LuaPath)
+	case "zig":
+		return strings.TrimSpace(s.config.ZigPath)
+	default:
+		return ""
+	}
+}
+
+// getLanguageServerArgs returns the command-line arguments for a language server.
+func (s *Service) getLanguageServerArgs(lang string) []string {
+	switch lang {
+	case "go":
+		return []string{"serve"}
+	case "python":
+		return []string{"--stdio"}
+	case "javascript", "typescript":
+		return []string{"--stdio"}
+	case "lua":
+		return []string{"--stdio"}
+	case "zig":
+		return nil
+	default:
+		return nil
+	}
+}
+
+// ensureLSPAvailable ensures an LSP server is available for the given language.
+// Priority: customPath → system PATH → auto-download
+func (s *Service) ensureLSPAvailable(ctx context.Context, lang, customPath string) (string, error) {
+	if s.downloader == nil {
+		// Fallback to old behavior if downloader failed to initialize
+		cmdPath, _ := s.getLanguageServerCommand(lang)
+		if cmdPath == "" {
+			return "", fmt.Errorf("language not supported: %s", lang)
+		}
+		return cmdPath, nil
+	}
+
+	return s.downloader.EnsureLSP(ctx, lang, customPath)
 }
 
 func isCommandAvailable(cmd string) bool {
