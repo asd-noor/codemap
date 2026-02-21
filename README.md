@@ -62,10 +62,8 @@ brew install zls
 
 CodeMap will automatically detect and use system-installed language servers before downloading. The search priority is:
 
-1. Custom path (via CLI flags like `--gopls-path`)
-2. CodeMap package manager (`~/.cache/codemap/packages/`)  
-3. System PATH
-4. Auto-download (if not found)
+1. System PATH
+2. CodeMap package manager (auto-download if not found)
 
 ### Installation
 
@@ -102,15 +100,8 @@ That's it! CodeMap will:
 cd /path/to/your/project
 /path/to/codemap
 
-# Or override the project directory
+# Or specify the project directory
 /path/to/codemap --project-dir /path/to/your/project
-
-# Or override language server paths
-/path/to/codemap --gopls-path /custom/gopls \
-  --pyright-langserver-path /custom/pyright-langserver \
-  --typescript-language-server-path /custom/typescript-language-server \
-  --lua-language-server-path /custom/lua-language-server \
-  --zls-path /custom/zls
 
 # Or via mise
 mise run run
@@ -176,7 +167,7 @@ CodeMap includes a **portable package manager** inspired by mason.nvim for manag
 - ✅ Automatic version management - each LSP has its own versioned directory
 - ✅ Unified bin directory - all executables symlinked to one location
 - ✅ Cross-platform - works on Linux, macOS, and Windows
-- ✅ Priority system - custom paths → CodeMap packages → system PATH → auto-download
+- ✅ Simple priority system - system PATH → auto-download
 
 **Custom Install Location:**
 ```bash

@@ -25,11 +25,6 @@ var systemPrompt string
 
 func main() {
 	projectDir := flag.String("project-dir", "", "Project directory to index (default: current working directory)")
-	goplsPath := flag.String("gopls-path", "", "Custom path to gopls language server")
-	pyrightPath := flag.String("pyright-langserver-path", "", "Custom path to pyright-langserver")
-	tsServerPath := flag.String("typescript-language-server-path", "", "Custom path to typescript-language-server")
-	luaServerPath := flag.String("lua-language-server-path", "", "Custom path to lua-language-server")
-	zlsPath := flag.String("zls-path", "", "Custom path to zls language server")
 	flag.Parse()
 
 	if *projectDir != "" {
@@ -81,13 +76,7 @@ func main() {
 	}
 
 	// 3. Setup LSP
-	lspSvc := lsp.NewServiceWithConfig(lsp.ServiceConfig{
-		GoPath:         *goplsPath,
-		PythonPath:     *pyrightPath,
-		TypeScriptPath: *tsServerPath,
-		LuaPath:        *luaServerPath,
-		ZigPath:        *zlsPath,
-	})
+	lspSvc := lsp.NewService()
 	defer lspSvc.Shutdown()
 
 	// 4. Setup signal handling for graceful shutdown

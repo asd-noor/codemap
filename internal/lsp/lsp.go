@@ -22,17 +22,7 @@ import (
 type Service struct {
 	clients map[string]*Client
 	mu      sync.Mutex
-	config  ServiceConfig
 	pkgMgr  *pkgmgr.Manager
-}
-
-// ServiceConfig allows overriding language server command paths.
-type ServiceConfig struct {
-	GoPath         string
-	PythonPath     string
-	TypeScriptPath string
-	LuaPath        string
-	ZigPath        string
 }
 
 // EnrichmentStats provides statistics about the enrichment process.
@@ -45,10 +35,6 @@ type EnrichmentStats struct {
 }
 
 func NewService() *Service {
-	return NewServiceWithConfig(ServiceConfig{})
-}
-
-func NewServiceWithConfig(config ServiceConfig) *Service {
 	mgr, err := pkgmgr.NewManager()
 	if err != nil {
 		log.Printf("Warning: Failed to initialize package manager: %v", err)
@@ -61,7 +47,6 @@ func NewServiceWithConfig(config ServiceConfig) *Service {
 	}
 	return &Service{
 		clients: make(map[string]*Client),
-		config:  config,
 		pkgMgr:  mgr,
 	}
 }
@@ -569,11 +554,8 @@ func (s *Service) detectAndStartLanguageServers(ctx context.Context, nodes []*gr
 
 	started := make(map[string]bool)
 	for lang := range langSet {
-		// Get custom path for this language
-		customPath := s.getCustomPath(lang)
-		
-		// Ensure LSP is available (custom → system → download)
-		cmdPath, err := s.ensureLSPAvailable(ctx, lang, customPath)
+		// Ensure LSP is available (system PATH → package manager)
+		cmdPath, err := s.ensureLSPAvailable(ctx, lang)
 		if err != nil {
 			log.Printf("Warning: Failed to get %s language server: %v", lang, err)
 			continue
@@ -777,75 +759,6 @@ func getLanguageID(lang string) string {
 	}
 }
 
-func (s *Service) getLanguageServerCommand(lang string) (string, []string) {
-	// Returns command path and args for starting a language server
-	switch lang {
-	case "go":
-		if path := strings.TrimSpace(s.config.GoPath); path != "" {
-			return path, []string{"serve"}
-		}
-		return "gopls", []string{"serve"}
-	case "python":
-		if path := strings.TrimSpace(s.config.PythonPath); path != "" {
-			return path, []string{"--stdio"}
-		}
-		return "pyright-langserver", []string{"--stdio"}
-	case "javascript", "typescript":
-		if path := strings.TrimSpace(s.config.TypeScriptPath); path != "" {
-			return path, []string{"--stdio"}
-		}
-		return "typescript-language-server", []string{"--stdio"}
-	case "lua":
-		if path := strings.TrimSpace(s.config.LuaPath); path != "" {
-			return path, []string{"--stdio"}
-		}
-		return "lua-language-server", []string{"--stdio"}
-	case "zig":
-		if path := strings.TrimSpace(s.config.ZigPath); path != "" {
-			return path, nil
-		}
-		return "zls", nil
-	default:
-		return "", nil
-	}
-}
-
-func getLanguageServerInstallInstructions(lang string) string {
-	// Returns installation instructions for a language server
-	switch lang {
-	case "go":
-		return "go install golang.org/x/tools/gopls@latest"
-	case "python":
-		return "pip install pyright"
-	case "javascript", "typescript":
-		return "npm install -g typescript-language-server typescript"
-	case "lua":
-		return "brew install lua-language-server  # or download from github.com/LuaLS/lua-language-server"
-	case "zig":
-		return "brew install zls  # or build from github.com/zigtools/zls"
-	default:
-		return ""
-	}
-}
-
-// getCustomPath returns the custom path for a language from config (if set).
-func (s *Service) getCustomPath(lang string) string {
-	switch lang {
-	case "go":
-		return strings.TrimSpace(s.config.GoPath)
-	case "python":
-		return strings.TrimSpace(s.config.PythonPath)
-	case "javascript", "typescript":
-		return strings.TrimSpace(s.config.TypeScriptPath)
-	case "lua":
-		return strings.TrimSpace(s.config.LuaPath)
-	case "zig":
-		return strings.TrimSpace(s.config.ZigPath)
-	default:
-		return ""
-	}
-}
-
 // getLanguageServerArgs returns the command-line arguments for a language server.
 func (s *Service) getLanguageServerArgs(lang string) []string {
 	switch lang {
@@ -865,27 +778,21 @@ func (s *Service) getLanguageServerArgs(lang string) []string {
 }
 
 // ensureLSPAvailable ensures an LSP server is available for the given language.
-// Priority: customPath → CodeMap packages → system PATH → auto-download
-func (s *Service) ensureLSPAvailable(ctx context.Context, lang, customPath string) (string, error) {
+// Priority: system PATH → CodeMap packages (auto-download)
+func (s *Service) ensureLSPAvailable(ctx context.Context, lang string) (string, error) {
 	if s.pkgMgr == nil {
-		// Fallback to old behavior if package manager failed to initialize
-		cmdPath, _ := s.getLanguageServerCommand(lang)
-		if cmdPath == "" {
-			return "", fmt.Errorf("language not supported: %s", lang)
+		// Fallback: try to find in system PATH
+		metadata, err := pkgmgr.GetLSPMetadata(lang)
+		if err != nil {
+			return "", err
 		}
-		return cmdPath, nil
+		if systemPath, err := findInPath(metadata.BinaryName); err == nil {
+			return systemPath, nil
+		}
+		return "", fmt.Errorf("package manager not available and %s not found in PATH", metadata.BinaryName)
 	}
 
-	// Priority 1: Custom path from flags
-	if customPath != "" {
-		if _, err := os.Stat(customPath); err == nil {
-			log.Printf("[%s] Using custom LSP path: %s", lang, customPath)
-			return customPath, nil
-		}
-		log.Printf("[%s] Custom path not found: %s, falling back...", lang, customPath)
-	}
-
-	// Priority 2: Check if already installed via package manager
+	// Priority 1: Check if already installed via package manager
 	if installed, _, _ := s.pkgMgr.IsInstalled(lang); installed {
 		binPath, err := s.pkgMgr.GetBinaryPath(lang)
 		if err == nil {
@@ -894,7 +801,7 @@ func (s *Service) ensureLSPAvailable(ctx context.Context, lang, customPath strin
 		}
 	}
 
-	// Priority 3: Check system PATH
+	// Priority 2: Check system PATH
 	metadata, err := pkgmgr.GetLSPMetadata(lang)
 	if err != nil {
 		return "", err
@@ -905,7 +812,7 @@ func (s *Service) ensureLSPAvailable(ctx context.Context, lang, customPath strin
 		return systemPath, nil
 	}
 
-	// Priority 4: Download and install via package manager
+	// Priority 3: Download and install via package manager
 	log.Printf("[%s] LSP not found, downloading %s %s...", lang, metadata.Name, metadata.Version)
 	
 	installer := pkgmgr.NewInstaller(s.pkgMgr)
