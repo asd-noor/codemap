@@ -155,7 +155,8 @@ CodeMap includes a **portable package manager** inspired by mason.nvim for manag
 │   ├── pyright/
 │   └── ...
 ├── registry/               # Package metadata
-└── tmp/                    # Temporary downloads
+├── tmp/                    # Temporary downloads
+└── .last_update_check      # Auto-update timestamp
 ```
 
 **Environment Variables:**
@@ -168,6 +169,32 @@ CodeMap includes a **portable package manager** inspired by mason.nvim for manag
 - ✅ Unified bin directory - all executables symlinked to one location
 - ✅ Cross-platform - works on Linux, macOS, and Windows
 - ✅ Simple priority system - system PATH → auto-download
+- ✅ **Auto-update** - checks for newer LSP versions on launch (once per 24h)
+
+**Auto-Update Behavior:**
+CodeMap automatically checks for LSP updates on launch:
+- Runs in background (non-blocking, doesn't delay startup)
+- Checks once every 24 hours (throttled)
+- Downloads newer versions if available
+- Updates take effect on next launch
+- Completely automatic and safe
+
+Example:
+```
+# First launch - checks for updates in background
+$ codemap
+[Auto-Update] Checking for LSP updates in background...
+[Auto-Update] Updating gopls from v0.21.1 to v0.21.2...
+[Auto-Update] Successfully updated gopls to v0.21.2
+
+# Second launch within 24h - skips update check
+$ codemap
+# (no update check, uses gopls v0.21.2)
+
+# Next launch after 24h+ - checks again
+$ codemap
+[Auto-Update] All packages are up to date
+```
 
 **Custom Install Location:**
 ```bash

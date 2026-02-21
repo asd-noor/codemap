@@ -44,6 +44,10 @@ func NewService() *Service {
 		if err := mgr.AddToPath(); err != nil {
 			log.Printf("Warning: Failed to add bin directory to PATH: %v", err)
 		}
+		
+		// Check for updates in background (non-blocking)
+		ctx := context.Background()
+		mgr.CheckAndUpdateInBackground(ctx)
 	}
 	return &Service{
 		clients: make(map[string]*Client),
