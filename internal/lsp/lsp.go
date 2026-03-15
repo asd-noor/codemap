@@ -44,7 +44,7 @@ func NewService() *Service {
 		if err := mgr.AddToPath(); err != nil {
 			log.Printf("Warning: Failed to add bin directory to PATH: %v", err)
 		}
-		
+
 		// Check for updates in background (non-blocking)
 		ctx := context.Background()
 		mgr.CheckAndUpdateInBackground(ctx)
@@ -740,6 +740,9 @@ func getLang(path string) string {
 	if len(path) > 4 && path[len(path)-4:] == ".zig" {
 		return "zig"
 	}
+	if len(path) > 6 && path[len(path)-6:] == ".templ" {
+		return "templ"
+	}
 	return ""
 }
 
@@ -758,6 +761,8 @@ func getLanguageID(lang string) string {
 		return "lua"
 	case "zig":
 		return "zig"
+	case "templ":
+		return "templ"
 	default:
 		return lang
 	}
@@ -776,6 +781,8 @@ func (s *Service) getLanguageServerArgs(lang string) []string {
 		return []string{"--stdio"}
 	case "zig":
 		return nil
+	case "templ":
+		return []string{"lsp"}
 	default:
 		return nil
 	}
@@ -810,7 +817,7 @@ func (s *Service) ensureLSPAvailable(ctx context.Context, lang string) (string, 
 	if err != nil {
 		return "", err
 	}
-	
+
 	if systemPath, err := findInPath(metadata.BinaryName); err == nil {
 		log.Printf("[%s] Using system LSP: %s", lang, systemPath)
 		return systemPath, nil
@@ -818,7 +825,7 @@ func (s *Service) ensureLSPAvailable(ctx context.Context, lang string) (string, 
 
 	// Priority 3: Download and install via package manager
 	log.Printf("[%s] LSP not found, downloading %s %s...", lang, metadata.Name, metadata.Version)
-	
+
 	installer := pkgmgr.NewInstaller(s.pkgMgr)
 	if err := installer.Install(ctx, lang, metadata); err != nil {
 		return "", fmt.Errorf("failed to install %s: %w", metadata.Name, err)

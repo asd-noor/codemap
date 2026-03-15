@@ -239,7 +239,12 @@ func (w *Watcher) addDirectoriesRecursively(root string) error {
 func (w *Watcher) isSourceFile(path string) bool {
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
-	case ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".lua":
+	case ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".lua", ".templ":
+		// skip generated Go files
+		base := filepath.Base(path)
+		if strings.HasSuffix(base, "_templ.go") || strings.HasSuffix(base, ".sql.go") || strings.HasSuffix(base, "_string.go") {
+			return false
+		}
 		return true
 	default:
 		return false

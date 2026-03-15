@@ -26,7 +26,7 @@ func GetLSPMetadata(lang string) (*LSPMetadata, error) {
 	if !ok {
 		return nil, fmt.Errorf("no metadata for language: %s", lang)
 	}
-	
+
 	// Clone metadata to avoid modifying the original
 	resolved := &LSPMetadata{
 		Name:            metadata.Name,
@@ -38,25 +38,25 @@ func GetLSPMetadata(lang string) (*LSPMetadata, error) {
 		ArchivePath:     metadata.ArchivePath,
 		VersionResolver: metadata.VersionResolver,
 	}
-	
+
 	// Resolve latest version if resolver is configured
 	if metadata.VersionResolver != nil {
 		ctx := context.Background()
 		latestVersion, err := metadata.VersionResolver.ResolveLatestVersion(ctx)
 		if err != nil {
-			log.Printf("[%s] Warning: failed to resolve latest version, using fallback %s: %v", 
+			log.Printf("[%s] Warning: failed to resolve latest version, using fallback %s: %v",
 				lang, metadata.Version, err)
 		} else {
 			resolved.Version = latestVersion
 			log.Printf("[%s] Resolved latest version: %s", lang, latestVersion)
 		}
 	}
-	
+
 	// Substitute {version} in download URLs
 	for platform, urlTemplate := range metadata.DownloadURLs {
 		resolved.DownloadURLs[platform] = strings.ReplaceAll(urlTemplate, "{version}", resolved.Version)
 	}
-	
+
 	return resolved, nil
 }
 
@@ -171,6 +171,30 @@ var lspMetadata = map[string]*LSPMetadata{
 		IsArchive:       true,
 		ArchivePath:     "zls",
 		VersionResolver: NewGitHubResolver("zigtools", "zls", ""),
+	},
+	"templ": {
+		Name:       "templ",
+		Version:    "v0.3.1001", // Fallback version
+		BinaryName: "templ",
+		DownloadURLs: map[string]string{
+			"linux-x86_64":   "https://github.com/a-h/templ/releases/download/{version}/templ_Linux_x86_64.tar.gz",
+			"linux-arm64":    "https://github.com/a-h/templ/releases/download/{version}/templ_Linux_arm64.tar.gz",
+			"darwin-x86_64":  "https://github.com/a-h/templ/releases/download/{version}/templ_Darwin_x86_64.tar.gz",
+			"darwin-arm64":   "https://github.com/a-h/templ/releases/download/{version}/templ_Darwin_arm64.tar.gz",
+			"windows-x86_64": "https://github.com/a-h/templ/releases/download/{version}/templ_Windows_x86_64.tar.gz",
+			"windows-arm64":  "https://github.com/a-h/templ/releases/download/{version}/templ_Windows_arm64.tar.gz",
+		},
+		Checksums: map[string]string{
+			"linux-x86_64":   "",
+			"linux-arm64":    "",
+			"darwin-x86_64":  "",
+			"darwin-arm64":   "",
+			"windows-x86_64": "",
+			"windows-arm64":  "",
+		},
+		IsArchive:       true,
+		ArchivePath:     "templ",
+		VersionResolver: NewGitHubResolver("a-h", "templ", ""),
 	},
 }
 
