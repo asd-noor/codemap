@@ -1,3 +1,8 @@
+// Package lsp implements an LSP client used by the codemap engine to enrich
+// the symbol graph with cross-file reference and implementation edges.
+//
+// Each language server gets one persistent Client subprocess. Enrichment runs
+// in a pool of workerCount goroutines.
 package lsp
 
 import (
@@ -6,11 +11,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
-	"strings"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"codemap/internal/graph"
@@ -18,852 +23,512 @@ import (
 	"codemap/util"
 )
 
-// Service manages LSP clients for different languages.
-type Service struct {
-	clients map[string]*Client
-	mu      sync.Mutex
-	pkgMgr  *pkgmgr.Manager
+const (
+	workerCount    = 10
+	callTimeout    = 10 * time.Second
+	warmupDuration = 5 * time.Second
+)
+
+// langServer describes one language server binary.
+type langServer struct {
+	langID string
+	binary string
+	args   []string
 }
 
-// EnrichmentStats provides statistics about the enrichment process.
-type EnrichmentStats struct {
-	FilesProcessed  int
-	FilesSkipped    int
-	LanguageServers map[string]bool
-	EdgesGenerated  int
-	Errors          []string
+// languageServers lists all supported language servers.
+var languageServers = []langServer{
+	{langID: "go", binary: "gopls", args: []string{"serve"}},
+	{langID: "python", binary: "pylsp", args: []string{"--stdio"}},
+	{langID: "javascript", binary: "typescript-language-server", args: []string{"--stdio"}},
+	{langID: "typescript", binary: "typescript-language-server", args: []string{"--stdio"}},
+	{langID: "lua", binary: "lua-language-server", args: []string{"--stdio"}},
+	{langID: "zig", binary: "zls", args: nil},
+	{langID: "templ", binary: "templ", args: []string{"lsp"}},
 }
 
-func NewService() *Service {
-	mgr, err := pkgmgr.NewManager()
-	if err != nil {
-		log.Printf("Warning: Failed to initialize package manager: %v", err)
-		log.Println("LSP auto-download will not be available")
-	} else {
-		// Add bin directory to PATH
-		if err := mgr.AddToPath(); err != nil {
-			log.Printf("Warning: Failed to add bin directory to PATH: %v", err)
-		}
-
-		// Check for updates in background (non-blocking)
-		ctx := context.Background()
-		mgr.CheckAndUpdateInBackground(ctx)
-	}
-	return &Service{
-		clients: make(map[string]*Client),
-		pkgMgr:  mgr,
-	}
+// extToLangID maps file extensions to language IDs.
+var extToLangID = map[string]string{
+	".go":    "go",
+	".py":    "python",
+	".js":    "javascript",
+	".jsx":   "javascript",
+	".ts":    "typescript",
+	".tsx":   "typescript",
+	".lua":   "lua",
+	".zig":   "zig",
+	".templ": "templ",
 }
 
-// Client represents a connection to a language server.
+// incomingMessage is used internally to parse any LSP message from the server.
+// It covers both JSON-RPC responses and server-initiated notifications.
+type incomingMessage struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      *int            `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *ResponseError  `json:"error,omitempty"`
+}
+
+// -------------------------------------------------------------------
+// Client
+// -------------------------------------------------------------------
+
+// Client is a persistent LSP subprocess client for one language server.
 type Client struct {
-	cmd      *exec.Cmd
-	lang     string
-	stdin    io.Writer
-	stdout   *bufio.Reader
-	seq      int
-	mu       sync.Mutex
-	pending  map[int]chan responseOrError
-	errChan  chan error
-	openDocs map[string]int // URI -> version
-	initTime time.Time      // When the server was initialized
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	reader    *bufio.Reader
+	mu        sync.Mutex
+	nextID    atomic.Int32
+	rootURI   string
+	startAt   time.Time
+	diagStore sync.Map // key: URI (string) → value: []Diagnostic
 }
 
-type responseOrError struct {
-	data json.RawMessage
-	err  error
-}
-
-func (s *Service) getClient(lang string) *Client {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.clients[lang]
-}
-
-// StartClient starts an LSP server for the given language.
-func (s *Service) StartClient(ctx context.Context, lang string, cmdPath string, args []string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// If already running, return
-	if c, ok := s.clients[lang]; ok && c.cmd.Process != nil {
-		return nil
-	}
-
-	cmd := exec.CommandContext(ctx, cmdPath, args...)
+// newClient starts the given language server binary and performs the
+// initialize / initialized handshake.
+func newClient(ctx context.Context, binary string, args []string, rootDir string) (*Client, error) {
+	cmd := exec.CommandContext(ctx, binary, args...) //nolint:gosec
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("lsp: stdin pipe: %w", err)
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("lsp: stdout pipe: %w", err)
 	}
-
-	// Stderr to parent stderr for debugging
-	cmd.Stderr = os.Stderr
+	cmd.Stderr = nil // discard LSP server log noise
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start %s lsp: %w", lang, err)
+		return nil, fmt.Errorf("lsp: start %s: %w", binary, err)
 	}
 
+	absRoot, _ := filepath.Abs(rootDir)
 	c := &Client{
-		cmd:      cmd,
-		lang:     lang,
-		stdin:    stdin,
-		stdout:   bufio.NewReader(stdout),
-		seq:      0,
-		pending:  make(map[int]chan responseOrError),
-		errChan:  make(chan error, 1),
-		openDocs: make(map[string]int),
-	}
-	s.clients[lang] = c
-
-	// Start background reader
-	go c.readLoop()
-
-	// Initialize Handshake
-	cwd, _ := os.Getwd()
-	initParams := InitializeParams{
-		ProcessID:    os.Getpid(),
-		RootURI:      util.PathToURI(cwd),
-		Capabilities: ClientCapabilities{},
+		cmd:     cmd,
+		stdin:   stdin,
+		reader:  bufio.NewReaderSize(stdout, 1<<20),
+		rootURI: util.PathToURI(absRoot),
+		startAt: time.Now(),
 	}
 
-	// Use context with timeout for initialization
-	initCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	if _, err := c.CallWithContext(initCtx, "initialize", initParams); err != nil {
-		return fmt.Errorf("initialize failed: %w", err)
+	if err := c.initialize(ctx); err != nil {
+		cmd.Process.Kill() //nolint:errcheck
+		return nil, fmt.Errorf("lsp: initialize %s: %w", binary, err)
 	}
-
-	// Send initialized notification
-	notif := Request{
-		JSONRPC: "2.0",
-		Method:  "initialized",
-		Params:  struct{}{},
-	}
-	WriteMessage(c.stdin, notif)
-
-	// Store initialization time for later checks
-	c.initTime = time.Now()
-
-	log.Printf("Started %s language server (indexing in background)", lang)
-
-	return nil
+	return c, nil
 }
 
-// Call sends a request and waits for the response with timeout.
-func (c *Client) Call(method string, params interface{}) (json.RawMessage, error) {
-	return c.CallWithContext(context.Background(), method, params)
+// nextRequestID returns a monotonically increasing request ID.
+func (c *Client) nextRequestID() int {
+	return int(c.nextID.Add(1))
 }
 
-// CallWithContext sends a request and waits for the response with context cancellation.
-func (c *Client) CallWithContext(ctx context.Context, method string, params interface{}) (json.RawMessage, error) {
-	c.mu.Lock()
-	c.seq++
-	id := c.seq
-	ch := make(chan responseOrError, 1)
-	c.pending[id] = ch
-	c.mu.Unlock()
-
-	defer func() {
-		c.mu.Lock()
-		delete(c.pending, id)
-		c.mu.Unlock()
-	}()
-
-	req := Request{
+// send writes a JSON-RPC request and waits for the matching response.
+// While waiting, any textDocument/publishDiagnostics notifications that arrive
+// are captured in c.diagStore. The caller must hold c.mu.
+func (c *Client) send(ctx context.Context, method string, params any, result any) error {
+	id := c.nextRequestID()
+	req := RequestMessage{
 		JSONRPC: "2.0",
 		ID:      id,
 		Method:  method,
 		Params:  params,
 	}
-
 	if err := WriteMessage(c.stdin, req); err != nil {
-		return nil, err
+		return err
 	}
 
-	// Wait for response, timeout, or server error
-	select {
-	case res := <-ch:
-		return res.data, res.err
-	case err := <-c.errChan:
-		return nil, fmt.Errorf("LSP server error: %w", err)
-	case <-ctx.Done():
-		return nil, fmt.Errorf("LSP call timeout: %w", ctx.Err())
+	// Ensure the context has a deadline; if not, impose callTimeout.
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, callTimeout)
+		defer cancel()
 	}
-}
 
-func (c *Client) readLoop() {
+	// Read responses until we find the one matching our ID.
+	// ReadMessage blocks on a bufio.Reader (pipe), so we run it in a goroutine
+	// and select against ctx.Done() to honour the deadline.
+	type readResult struct {
+		msg incomingMessage
+		err error
+	}
+
 	for {
-		msgBytes, err := ReadMessage(c.stdout)
-		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "closed") {
-				log.Printf("LSP read error: %v", err)
-				select {
-				case c.errChan <- err:
-				default:
-				}
-			}
-			return
-		}
-
-		// Try to decode as Response
-		var rawResp struct {
-			Result json.RawMessage `json:"result"`
-			Error  *RPCError       `json:"error"`
-			ID     interface{}     `json:"id"`
-		}
-
-		if err := json.Unmarshal(msgBytes, &rawResp); err == nil {
-			// LSP IDs can be int or string
-			var id int
-			var idSet bool
-
-			switch v := rawResp.ID.(type) {
-			case float64:
-				id = int(v)
-				idSet = true
-			case int:
-				id = v
-				idSet = true
-			}
-
-			if idSet {
-				c.mu.Lock()
-				ch, ok := c.pending[id]
-				c.mu.Unlock()
-
-				if ok {
-					var resErr error
-					if rawResp.Error != nil {
-						resErr = fmt.Errorf("RPC error %d: %s", rawResp.Error.Code, rawResp.Error.Message)
-					}
-					ch <- responseOrError{data: rawResp.Result, err: resErr}
-				}
-			}
-		}
-		// Notifications (no ID) or unrecognized messages are ignored for now
-	}
-}
-
-// Notify sends a notification (request without expecting a response).
-func (c *Client) Notify(method string, params interface{}) error {
-	notif := Request{
-		JSONRPC: "2.0",
-		Method:  method,
-		Params:  params,
-	}
-	return WriteMessage(c.stdin, notif)
-}
-
-// DidOpen notifies the server that a document has been opened.
-func (c *Client) DidOpen(ctx context.Context, uri, languageID, text string) error {
-	c.mu.Lock()
-	c.openDocs[uri] = 1
-	c.mu.Unlock()
-
-	params := DidOpenTextDocumentParams{
-		TextDocument: TextDocumentItem{
-			URI:        uri,
-			LanguageID: languageID,
-			Version:    1,
-			Text:       text,
-		},
-	}
-	return c.Notify("textDocument/didOpen", params)
-}
-
-// DidClose notifies the server that a document has been closed.
-func (c *Client) DidClose(ctx context.Context, uri string) error {
-	c.mu.Lock()
-	delete(c.openDocs, uri)
-	c.mu.Unlock()
-
-	params := DidCloseTextDocumentParams{
-		TextDocument: TextDocumentIdentifier{URI: uri},
-	}
-	return c.Notify("textDocument/didClose", params)
-}
-
-// GetDefinition requests the definition location of a symbol.
-func (c *Client) GetDefinition(ctx context.Context, uri string, line, char int) ([]Location, error) {
-	params := DefinitionParams{
-		TextDocument: TextDocumentIdentifier{URI: uri},
-		Position:     Position{Line: line, Character: char},
-	}
-
-	// Add timeout if context doesn't have one
-	ctx, cancel := ensureTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	resBytes, err := c.CallWithContext(ctx, "textDocument/definition", params)
-	if err != nil {
-		return nil, err
-	}
-
-	// Definition can return Location, []Location, or LocationLink[]
-	// For simplicity, handle Location and []Location
-	var locs []Location
-
-	// Try single Location first
-	var singleLoc Location
-	if err := json.Unmarshal(resBytes, &singleLoc); err == nil && singleLoc.URI != "" {
-		return []Location{singleLoc}, nil
-	}
-
-	// Try array of Locations
-	if err := json.Unmarshal(resBytes, &locs); err != nil {
-		return nil, fmt.Errorf("failed to parse definition response: %w", err)
-	}
-
-	return locs, nil
-}
-
-// GetImplementation requests the implementation locations of a symbol.
-func (c *Client) GetImplementation(ctx context.Context, uri string, line, char int) ([]Location, error) {
-	params := ImplementationParams{
-		TextDocument: TextDocumentIdentifier{URI: uri},
-		Position:     Position{Line: line, Character: char},
-	}
-
-	ctx, cancel := ensureTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	resBytes, err := c.CallWithContext(ctx, "textDocument/implementation", params)
-	if err != nil {
-		return nil, err
-	}
-
-	var locs []Location
-	if err := json.Unmarshal(resBytes, &locs); err != nil {
-		return nil, fmt.Errorf("failed to parse implementation response: %w", err)
-	}
-
-	return locs, nil
-}
-
-// GetReferences requests all references to a symbol.
-func (c *Client) GetReferences(ctx context.Context, uri string, line, char int, includeDeclaration bool) ([]Location, error) {
-	params := ReferenceParams{
-		TextDocument: TextDocumentIdentifier{URI: uri},
-		Position:     Position{Line: line, Character: char},
-		Context:      ReferenceContext{IncludeDeclaration: includeDeclaration},
-	}
-
-	ctx, cancel := ensureTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	resBytes, err := c.CallWithContext(ctx, "textDocument/references", params)
-	if err != nil {
-		return nil, err
-	}
-
-	var locs []Location
-	if err := json.Unmarshal(resBytes, &locs); err != nil {
-		return nil, fmt.Errorf("failed to parse references response: %w", err)
-	}
-
-	return locs, nil
-}
-
-// GetHover requests hover information for a symbol.
-func (c *Client) GetHover(ctx context.Context, uri string, line, char int) (*Hover, error) {
-	params := HoverParams{
-		TextDocument: TextDocumentIdentifier{URI: uri},
-		Position:     Position{Line: line, Character: char},
-	}
-
-	ctx, cancel := ensureTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	resBytes, err := c.CallWithContext(ctx, "textDocument/hover", params)
-	if err != nil {
-		return nil, err
-	}
-
-	var hover Hover
-	if err := json.Unmarshal(resBytes, &hover); err != nil {
-		return nil, fmt.Errorf("failed to parse hover response: %w", err)
-	}
-
-	return &hover, nil
-}
-
-// GetDocumentSymbols requests all symbols in a document.
-func (c *Client) GetDocumentSymbols(ctx context.Context, uri string) ([]DocumentSymbol, error) {
-	params := DocumentSymbolParams{
-		TextDocument: TextDocumentIdentifier{URI: uri},
-	}
-
-	ctx, cancel := ensureTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	resBytes, err := c.CallWithContext(ctx, "textDocument/documentSymbol", params)
-	if err != nil {
-		return nil, err
-	}
-
-	var symbols []DocumentSymbol
-	if err := json.Unmarshal(resBytes, &symbols); err != nil {
-		return nil, fmt.Errorf("failed to parse document symbols response: %w", err)
-	}
-
-	return symbols, nil
-}
-
-// NodeResolver is an interface to find nodes by location.
-type NodeResolver interface {
-	FindNode(ctx context.Context, path string, line, col int) (*graph.Node, error)
-}
-
-// Enrich uses LSP to find cross-file references and generate edges.
-// Returns edges and statistics about the enrichment process.
-func (s *Service) Enrich(ctx context.Context, nodes []*graph.Node, resolver NodeResolver) ([]*graph.Edge, error) {
-	stats := &EnrichmentStats{
-		LanguageServers: make(map[string]bool),
-		Errors:          []string{},
-	}
-
-	// Detect required language servers from the codebase
-	requiredLangs := s.detectRequiredLanguages(nodes)
-	if len(requiredLangs) == 0 {
-		log.Printf("No supported languages detected")
-		return nil, nil
-	}
-
-	// Validate that language servers are installed
-	if err := s.validateLanguageServers(requiredLangs); err != nil {
-		return nil, err
-	}
-
-	// Auto-start language servers based on files we see
-	langServers := s.detectAndStartLanguageServers(ctx, nodes)
-	stats.LanguageServers = langServers
-
-	if len(langServers) == 0 {
-		return nil, fmt.Errorf("failed to start any language servers")
-	}
-
-	// Wait adaptively for indexing - only blocks if servers just started
-	s.waitForIndexing(langServers)
-
-	// Open documents in LSP
-	openedDocs := make(map[string]bool)
-	var docsMu sync.Mutex
-
-	defer func() {
-		// Close all opened documents
-		for uri := range openedDocs {
-			if c := s.getClientByURI(uri); c != nil {
-				c.DidClose(ctx, uri)
-			}
-		}
-	}()
-
-	// Use a worker pool for enrichment
-	const numWorkers = 10
-	nodeChan := make(chan *graph.Node, len(nodes))
-	edgeChan := make(chan []*graph.Edge, len(nodes))
-	var wg sync.WaitGroup
-
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
+		ch := make(chan readResult, 1)
 		go func() {
-			defer wg.Done()
-			for n := range nodeChan {
-				lang := getLang(n.FilePath)
-				client := s.getClient(lang)
-				if client == nil {
-					continue
-				}
-
-				// Ensure document is open
-				uri := util.PathToURI(n.FilePath)
-				docsMu.Lock()
-				isOpen := openedDocs[uri]
-				if !isOpen {
-					text, err := os.ReadFile(n.FilePath)
-					if err != nil {
-						errMsg := fmt.Sprintf("Failed to read file %s: %v", n.FilePath, err)
-						log.Println(errMsg)
-						docsMu.Unlock()
-						continue
-					}
-
-					langID := getLanguageID(lang)
-					if err := client.DidOpen(ctx, uri, langID, string(text)); err != nil {
-						errMsg := fmt.Sprintf("Failed to open document %s: %v", uri, err)
-						log.Println(errMsg)
-						docsMu.Unlock()
-						continue
-					}
-					openedDocs[uri] = true
-				}
-				docsMu.Unlock()
-
-				// Only process definitions (functions, classes, methods)
-				if n.Name == "" || !isDefinitionKind(n.Kind) {
-					continue
-				}
-
-				var nodeEdges []*graph.Edge
-				// Find references to this symbol
-				refEdges := s.findReferenceEdges(ctx, client, n, resolver)
-				nodeEdges = append(nodeEdges, refEdges...)
-
-				// Find implementations if this is an interface
-				if isInterfaceKind(n.Kind) {
-					implEdges := s.findImplementationEdges(ctx, client, n, resolver)
-					nodeEdges = append(nodeEdges, implEdges...)
-				}
-				edgeChan <- nodeEdges
-			}
+			var msg incomingMessage
+			err := ReadMessage(c.reader, &msg)
+			ch <- readResult{msg, err}
 		}()
-	}
 
-	// Feed workers
-	for _, n := range nodes {
-		nodeChan <- n
-	}
-	close(nodeChan)
-
-	// Collect results
-	go func() {
-		wg.Wait()
-		close(edgeChan)
-	}()
-
-	var edges []*graph.Edge
-	for eList := range edgeChan {
-		edges = append(edges, eList...)
-	}
-
-	stats.EdgesGenerated = len(edges)
-	log.Printf("Enrichment complete: %d edges generated", len(edges))
-
-	return edges, nil
-}
-
-// detectAndStartLanguageServers detects languages and starts appropriate servers.
-func (s *Service) detectAndStartLanguageServers(ctx context.Context, nodes []*graph.Node) map[string]bool {
-	langSet := make(map[string]bool)
-	for _, n := range nodes {
-		if lang := getLang(n.FilePath); lang != "" {
-			langSet[lang] = true
-		}
-	}
-
-	started := make(map[string]bool)
-	for lang := range langSet {
-		// Ensure LSP is available (system PATH → package manager)
-		cmdPath, err := s.ensureLSPAvailable(ctx, lang)
-		if err != nil {
-			log.Printf("Warning: Failed to get %s language server: %v", lang, err)
-			continue
-		}
-
-		args := s.getLanguageServerArgs(lang)
-		if err := s.StartClient(ctx, lang, cmdPath, args); err != nil {
-			log.Printf("Warning: Failed to start %s language server: %v", lang, err)
-		} else {
-			started[lang] = true
-			log.Printf("Started %s language server", lang)
-		}
-	}
-
-	return started
-}
-
-// detectRequiredLanguages scans nodes and returns unique languages needed.
-func (s *Service) detectRequiredLanguages(nodes []*graph.Node) map[string]bool {
-	langSet := make(map[string]bool)
-	for _, n := range nodes {
-		lang := getLang(n.FilePath)
-		if lang != "" {
-			langSet[lang] = true
-		}
-	}
-	return langSet
-}
-
-// validateLanguageServers is now deprecated - we auto-download instead.
-// Kept for backwards compatibility but returns nil.
-func (s *Service) validateLanguageServers(requiredLangs map[string]bool) error {
-	// Auto-download will handle missing servers, no need to fail here
-	return nil
-}
-
-// waitForIndexing waits adaptively for language servers to index.
-// Only waits if servers were recently started; skips if already had time.
-func (s *Service) waitForIndexing(langServers map[string]bool) {
-	const minIndexTime = 5 * time.Second // Increased for reliability
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Find the most recently started server
-	var newestInitTime time.Time
-	for lang := range langServers {
-		if client, ok := s.clients[lang]; ok {
-			if newestInitTime.IsZero() || client.initTime.After(newestInitTime) {
-				newestInitTime = client.initTime
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("lsp: %s timed out: %w", method, ctx.Err())
+		case r := <-ch:
+			if r.err != nil {
+				return r.err
 			}
+			// Server-initiated notification (no ID field) — handle and keep reading.
+			if r.msg.ID == nil {
+				c.handleNotification(r.msg)
+				continue
+			}
+			// Response for a different in-flight request — keep reading.
+			if *r.msg.ID != id {
+				continue
+			}
+			// Matched response.
+			if r.msg.Error != nil {
+				return fmt.Errorf("lsp: %s error %d: %s", method, r.msg.Error.Code, r.msg.Error.Message)
+			}
+			if result != nil && r.msg.Result != nil {
+				return json.Unmarshal(r.msg.Result, result)
+			}
+			return nil
 		}
-	}
-
-	if newestInitTime.IsZero() {
-		return // No servers to wait for
-	}
-
-	elapsed := time.Since(newestInitTime)
-	if elapsed < minIndexTime {
-		waitTime := minIndexTime - elapsed
-		log.Printf("[Background] Waiting %.1fs for language servers to index workspace...", waitTime.Seconds())
-		time.Sleep(waitTime)
-	} else {
-		log.Printf("[Background] Language servers already had %.1fs to index, proceeding immediately", elapsed.Seconds())
 	}
 }
 
-// findReferenceEdges finds all references to a symbol and creates edges.
-func (s *Service) findReferenceEdges(ctx context.Context, client *Client, n *graph.Node, resolver NodeResolver) []*graph.Edge {
-	var edges []*graph.Edge
-
-	uri := util.PathToURI(n.FilePath)
-	locs, err := client.GetReferences(ctx, uri, n.LineStart-1, n.ColStart-1, false)
-	if err != nil {
-		// Not all symbols have references, this is expected
-		return edges
+// handleNotification dispatches a server-initiated notification.
+// Called inside the send loop while c.mu is held.
+func (c *Client) handleNotification(msg incomingMessage) {
+	if msg.Method != "textDocument/publishDiagnostics" || len(msg.Params) == 0 {
+		return
 	}
-
-	for _, loc := range locs {
-		targetPath := util.URIToPath(loc.URI)
-		// Look up the node that contains this reference (the caller)
-		sourceNode, err := resolver.FindNode(ctx, targetPath, loc.Range.Start.Line+1, loc.Range.Start.Character+1)
-		if err != nil {
-			continue // Skip if lookup fails
-		}
-
-		if sourceNode != nil && sourceNode.ID != n.ID {
-			edges = append(edges, &graph.Edge{
-				SourceID: sourceNode.ID,
-				TargetID: n.ID,
-				Relation: "references",
-			})
-		}
+	var p PublishDiagnosticsParams
+	if err := json.Unmarshal(msg.Params, &p); err != nil {
+		return
 	}
-
-	return edges
+	// Store the full diagnostic list for the URI, overwriting any previous value
+	// (the server always sends the complete current set for a file).
+	c.diagStore.Store(p.URI, p.Diagnostics)
 }
 
-// findImplementationEdges finds implementations of an interface.
-func (s *Service) findImplementationEdges(ctx context.Context, client *Client, n *graph.Node, resolver NodeResolver) []*graph.Edge {
-	var edges []*graph.Edge
-
-	uri := util.PathToURI(n.FilePath)
-	locs, err := client.GetImplementation(ctx, uri, n.LineStart-1, n.ColStart-1)
-	if err != nil {
-		return edges
-	}
-
-	for _, loc := range locs {
-		targetPath := util.URIToPath(loc.URI)
-		implNode, err := resolver.FindNode(ctx, targetPath, loc.Range.Start.Line+1, loc.Range.Start.Character+1)
-		if err != nil {
-			continue
-		}
-
-		if implNode != nil && implNode.ID != n.ID {
-			edges = append(edges, &graph.Edge{
-				SourceID: implNode.ID,
-				TargetID: n.ID,
-				Relation: "implements",
-			})
-		}
-	}
-
-	return edges
+// DrainDiagnostics returns every publishDiagnostics notification captured
+// during send calls and clears the internal cache. Keys are document URIs.
+func (c *Client) DrainDiagnostics() map[string][]Diagnostic {
+	out := make(map[string][]Diagnostic)
+	c.diagStore.Range(func(k, v any) bool {
+		uri, _ := k.(string)
+		diags, _ := v.([]Diagnostic)
+		out[uri] = diags
+		c.diagStore.Delete(k)
+		return true
+	})
+	return out
 }
 
-// getClientByURI returns the client for a given URI.
-func (s *Service) getClientByURI(uri string) *Client {
-	// Extract language from URI (simplified)
-	path := util.URIToPath(uri)
-	lang := getLang(path)
-	return s.getClient(lang)
+// notify sends a JSON-RPC notification (no response expected).
+func (c *Client) notify(method string, params any) error {
+	n := NotificationMessage{JSONRPC: "2.0", Method: method, Params: params}
+	return WriteMessage(c.stdin, n)
 }
 
-func (s *Service) Shutdown() {
+// initialize sends the LSP initialize request + initialized notification.
+func (c *Client) initialize(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	params := InitializeParams{
+		ProcessID:    os.Getpid(),
+		RootURI:      c.rootURI,
+		Capabilities: ClientCapabilities{},
+	}
+	var result InitializeResult
+	if err := c.send(ctx, "initialize", params, &result); err != nil {
+		return err
+	}
+	return c.notify("initialized", map[string]any{})
+}
+
+// didOpen notifies the server that a file is open.
+func (c *Client) didOpen(uri, langID, text string) error {
+	return c.notify("textDocument/didOpen", DidOpenTextDocumentParams{
+		TextDocument: TextDocumentItem{URI: uri, LanguageID: langID, Version: 1, Text: text},
+	})
+}
+
+// didClose notifies the server that a file is closed.
+func (c *Client) didClose(uri string) error {
+	return c.notify("textDocument/didClose", DidCloseTextDocumentParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+	})
+}
+
+// references calls textDocument/references for the given position.
+func (c *Client) references(ctx context.Context, uri string, pos Position) ([]Location, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+
+	var locs []Location
+	err := c.send(ctx, "textDocument/references", ReferencesParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+		Position:     pos,
+		Context:      ReferenceContext{IncludeDeclaration: false},
+	}, &locs)
+	return locs, err
+}
+
+// implementations calls textDocument/implementation for the given position.
+func (c *Client) implementations(ctx context.Context, uri string, pos Position) ([]Location, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(ctx, callTimeout)
+	defer cancel()
+
+	var locs []Location
+	err := c.send(ctx, "textDocument/implementation", ImplementationParams{
+		TextDocument: TextDocumentIdentifier{URI: uri},
+		Position:     pos,
+	}, &locs)
+	return locs, err
+}
+
+// Close shuts down the LSP subprocess.
+func (c *Client) Close() {
+	c.notify("shutdown", nil) //nolint:errcheck
+	c.notify("exit", nil)     //nolint:errcheck
+	c.stdin.Close()           //nolint:errcheck
+	c.cmd.Wait()              //nolint:errcheck
+}
+
+// warmupWait blocks until the adaptive warmup period has elapsed.
+func (c *Client) warmupWait() {
+	elapsed := time.Since(c.startAt)
+	if remaining := warmupDuration - elapsed; remaining > 0 {
+		time.Sleep(remaining)
+	}
+}
+
+// -------------------------------------------------------------------
+// Service — manages one Client per language, drives enrichment
+// -------------------------------------------------------------------
+
+// Service manages per-language LSP clients and drives the enrichment phase.
+type Service struct {
+	rootDir string
+	pm      *pkgmgr.Manager
+	clients map[string]*Client // keyed by langID
+	mu      sync.Mutex
+}
+
+// NewService creates a new Service for the given project root.
+func NewService(rootDir string, pm *pkgmgr.Manager) *Service {
+	return &Service{
+		rootDir: rootDir,
+		pm:      pm,
+		clients: make(map[string]*Client),
+	}
+}
+
+// Close shuts down all active LSP clients.
+func (s *Service) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, c := range s.clients {
-		if c.cmd.Process != nil {
-			c.cmd.Process.Kill()
+		c.Close()
+	}
+	s.clients = make(map[string]*Client)
+}
+
+// getClient returns an existing client for langID, or starts a new one.
+func (s *Service) getClient(ctx context.Context, langID string) (*Client, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if c, ok := s.clients[langID]; ok {
+		return c, nil
+	}
+
+	// Find the language server spec.
+	var spec *langServer
+	for i := range languageServers {
+		if languageServers[i].langID == langID {
+			spec = &languageServers[i]
+			break
 		}
 	}
+	if spec == nil {
+		return nil, fmt.Errorf("lsp: no server for language %q", langID)
+	}
+
+	// Resolve binary: PATH → pkgmgr cache → auto-download.
+	binary, err := s.pm.ResolveBinary(ctx, spec.binary)
+	if err != nil {
+		return nil, fmt.Errorf("lsp: resolve %s: %w", spec.binary, err)
+	}
+
+	c, err := newClient(ctx, binary, spec.args, s.rootDir)
+	if err != nil {
+		return nil, err
+	}
+	s.clients[langID] = c
+	return c, nil
 }
 
-// ensureTimeout wraps a context with a timeout if it doesn't already have one.
-func ensureTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
-	if _, hasDeadline := ctx.Deadline(); hasDeadline {
-		return ctx, func() {}
+// Enrich takes the nodes produced by the scanner, queries each language server
+// for references and implementations, and returns the resulting edges.
+// Any textDocument/publishDiagnostics notifications received during enrichment
+// are captured inside each Client and can be retrieved via DrainDiagnostics.
+func (s *Service) Enrich(ctx context.Context, nodes []graph.Node, store *graph.Store) ([]graph.Edge, error) {
+	if len(nodes) == 0 {
+		return nil, nil
 	}
-	return context.WithTimeout(ctx, timeout)
-}
 
-func getLang(path string) string {
-	// Simple mapping based on file extension
-	if len(path) > 3 && path[len(path)-3:] == ".go" {
-		return "go"
+	// Group nodes by language so we open each file once per language.
+	byLang := make(map[string][]graph.Node)
+	for _, n := range nodes {
+		ext := filepath.Ext(n.FilePath)
+		langID, ok := extToLangID[ext]
+		if !ok {
+			continue
+		}
+		byLang[langID] = append(byLang[langID], n)
 	}
-	if len(path) > 3 && path[len(path)-3:] == ".py" {
-		return "python"
-	}
-	if len(path) > 3 && path[len(path)-3:] == ".js" {
-		return "javascript"
-	}
-	if len(path) > 3 && path[len(path)-3:] == ".ts" {
-		return "typescript"
-	}
-	if len(path) > 4 && path[len(path)-4:] == ".tsx" {
-		return "typescript"
-	}
-	if len(path) > 4 && path[len(path)-4:] == ".jsx" {
-		return "javascript"
-	}
-	if len(path) > 4 && path[len(path)-4:] == ".lua" {
-		return "lua"
-	}
-	if len(path) > 4 && path[len(path)-4:] == ".zig" {
-		return "zig"
-	}
-	if len(path) > 6 && path[len(path)-6:] == ".templ" {
-		return "templ"
-	}
-	return ""
-}
 
-func getLanguageID(lang string) string {
-	// LSP language IDs
-	switch lang {
-	case "go":
-		return "go"
-	case "python":
-		return "python"
-	case "javascript":
-		return "javascript"
-	case "typescript":
-		return "typescript"
-	case "lua":
-		return "lua"
-	case "zig":
-		return "zig"
-	case "templ":
-		return "templ"
-	default:
-		return lang
-	}
-}
+	// Collect all edges from all languages.
+	var (
+		edgeMu   sync.Mutex
+		allEdges []graph.Edge
+	)
 
-// getLanguageServerArgs returns the command-line arguments for a language server.
-func (s *Service) getLanguageServerArgs(lang string) []string {
-	switch lang {
-	case "go":
-		return []string{"serve"}
-	case "python":
-		return []string{"--stdio"}
-	case "javascript", "typescript":
-		return []string{"--stdio"}
-	case "lua":
-		return []string{"--stdio"}
-	case "zig":
-		return nil
-	case "templ":
-		return []string{"lsp"}
-	default:
-		return nil
-	}
-}
-
-// ensureLSPAvailable ensures an LSP server is available for the given language.
-// Priority: system PATH → CodeMap packages (auto-download)
-func (s *Service) ensureLSPAvailable(ctx context.Context, lang string) (string, error) {
-	if s.pkgMgr == nil {
-		// Fallback: try to find in system PATH
-		metadata, err := pkgmgr.GetLSPMetadata(lang)
+	for langID, langNodes := range byLang {
+		client, err := s.getClient(ctx, langID)
 		if err != nil {
-			return "", err
+			// Language server unavailable — skip this language.
+			continue
 		}
-		if systemPath, err := findInPath(metadata.BinaryName); err == nil {
-			return systemPath, nil
+
+		// Adaptive warmup: wait until the server has had time to index.
+		client.warmupWait()
+
+		// Fan out enrichment across the worker pool.
+		work := make(chan graph.Node, len(langNodes))
+		for _, n := range langNodes {
+			work <- n
 		}
-		return "", fmt.Errorf("package manager not available and %s not found in PATH", metadata.BinaryName)
-	}
+		close(work)
 
-	// Priority 1: Check if already installed via package manager
-	if installed, _, _ := s.pkgMgr.IsInstalled(lang); installed {
-		binPath, err := s.pkgMgr.GetBinaryPath(lang)
-		if err == nil {
-			log.Printf("[%s] Using package manager LSP: %s", lang, binPath)
-			return binPath, nil
+		var wg sync.WaitGroup
+		for i := 0; i < workerCount; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for n := range work {
+					if ctx.Err() != nil {
+						return
+					}
+					edges := s.enrichNode(ctx, client, langID, n, store)
+					if len(edges) > 0 {
+						edgeMu.Lock()
+						allEdges = append(allEdges, edges...)
+						edgeMu.Unlock()
+					}
+				}
+			}()
 		}
+		wg.Wait()
 	}
 
-	// Priority 2: Check system PATH
-	metadata, err := pkgmgr.GetLSPMetadata(lang)
-	if err != nil {
-		return "", err
-	}
-
-	if systemPath, err := findInPath(metadata.BinaryName); err == nil {
-		log.Printf("[%s] Using system LSP: %s", lang, systemPath)
-		return systemPath, nil
-	}
-
-	// Priority 3: Download and install via package manager
-	log.Printf("[%s] LSP not found, downloading %s %s...", lang, metadata.Name, metadata.Version)
-
-	installer := pkgmgr.NewInstaller(s.pkgMgr)
-	if err := installer.Install(ctx, lang, metadata); err != nil {
-		return "", fmt.Errorf("failed to install %s: %w", metadata.Name, err)
-	}
-
-	binPath, err := s.pkgMgr.GetBinaryPath(lang)
-	if err != nil {
-		return "", fmt.Errorf("failed to get installed binary path: %w", err)
-	}
-
-	return binPath, nil
+	return allEdges, ctx.Err()
 }
 
-// findInPath searches for a binary in the system PATH.
-func findInPath(binaryName string) (string, error) {
-	path, err := exec.LookPath(binaryName)
+// DrainDiagnostics collects and clears all publishDiagnostics notifications
+// that were captured across every active LSP client during the last Enrich call.
+// The returned map key is the document URI as sent by the language server.
+func (s *Service) DrainDiagnostics() map[string][]Diagnostic {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	merged := make(map[string][]Diagnostic)
+	for _, c := range s.clients {
+		for uri, diags := range c.DrainDiagnostics() {
+			merged[uri] = diags
+		}
+	}
+	return merged
+}
+
+// enrichNode opens the file, queries references/implementations for node n,
+// and returns all edges found.
+func (s *Service) enrichNode(ctx context.Context, c *Client, langID string, n graph.Node, store *graph.Store) []graph.Edge {
+	uri := util.PathToURI(n.FilePath)
+	text, err := os.ReadFile(n.FilePath)
 	if err != nil {
-		return "", fmt.Errorf("%s not found in PATH", binaryName)
+		return nil
 	}
-	return path, nil
-}
 
-func isDefinitionKind(kind string) bool {
-	// Check if this node kind represents a definition we want to track
-	definitionKinds := map[string]bool{
-		"function_declaration":  true,
-		"method_declaration":    true,
-		"method_definition":     true,
-		"function_definition":   true,
-		"class_definition":      true,
-		"class_declaration":     true,
-		"interface_declaration": true,
-		"type_definition":       true,
+	// Open the file in the language server.
+	c.mu.Lock()
+	if err := c.didOpen(uri, langID, string(text)); err != nil {
+		c.mu.Unlock()
+		return nil
 	}
-	return definitionKinds[kind]
-}
+	c.mu.Unlock()
+	defer func() {
+		c.mu.Lock()
+		c.didClose(uri) //nolint:errcheck
+		c.mu.Unlock()
+	}()
 
-func isInterfaceKind(kind string) bool {
-	// Check if this is an interface/protocol that can be implemented
-	return kind == "interface_declaration" || kind == "protocol_declaration"
+	// Use the position of the name identifier (0-indexed for LSP).
+	// NameLine/NameCol point at the symbol name token, which gopls requires
+	// for textDocument/references to return results (not the declaration keyword).
+	pos := Position{
+		Line:      n.NameLine - 1,
+		Character: n.NameCol - 1,
+	}
+
+	var edges []graph.Edge
+
+	// references: (caller) --references--> (n)
+	refs, _ := c.references(ctx, uri, pos)
+	for _, loc := range refs {
+		refPath := util.URIToPath(loc.URI)
+		refLine := loc.Range.Start.Line + 1
+		refCol := loc.Range.Start.Character + 1
+		caller, err := store.FindNode(ctx, refPath, refLine, refCol)
+		if err != nil || caller == nil {
+			continue
+		}
+		if caller.ID == n.ID {
+			continue // skip self-reference
+		}
+		edges = append(edges, graph.Edge{
+			SourceID: caller.ID,
+			TargetID: n.ID,
+			Relation: graph.RelationReferences,
+		})
+	}
+
+	// implementations: (impl) --implements--> (n)  (only for interface-kind nodes)
+	if n.Kind == "interface" || n.Kind == "type" {
+		impls, _ := c.implementations(ctx, uri, pos)
+		for _, loc := range impls {
+			implPath := util.URIToPath(loc.URI)
+			implLine := loc.Range.Start.Line + 1
+			implCol := loc.Range.Start.Character + 1
+			implNode, err := store.FindNode(ctx, implPath, implLine, implCol)
+			if err != nil || implNode == nil {
+				continue
+			}
+			if implNode.ID == n.ID {
+				continue
+			}
+			edges = append(edges, graph.Edge{
+				SourceID: implNode.ID,
+				TargetID: n.ID,
+				Relation: graph.RelationImplements,
+			})
+		}
+	}
+
+	return edges
 }

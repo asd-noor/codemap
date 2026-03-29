@@ -1,209 +1,370 @@
+// Package pkgmgr — metadata.go
+// Per-language-server install metadata.
 package pkgmgr
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"compress/gzip"
 	"context"
 	"fmt"
-	"log"
+	"io"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 )
 
-// LSPMetadata defines version and download information for an LSP server.
-type LSPMetadata struct {
-	Name            string
-	Version         string            // Used as fallback if version resolution fails
-	BinaryName      string            // name of the executable in the archive
-	DownloadURLs    map[string]string // platform -> download URL template (use {version} placeholder)
-	Checksums       map[string]string // platform -> SHA256 checksum
-	IsArchive       bool              // whether download is an archive (tar.gz/zip)
-	ArchivePath     string            // path to binary within archive (if applicable)
-	VersionResolver VersionResolver   // Optional: resolver for fetching latest version dynamically
+// installFn is a function that installs a binary and returns its path.
+type installFn func(ctx context.Context, name string) (string, error)
+
+// versionFn returns the currently installed version of a binary given its resolved path.
+type versionFn func(ctx context.Context, binaryPath string) (string, error)
+
+// latestFn returns the latest available version string for a binary.
+type latestFn func(ctx context.Context) (string, error)
+
+// meta bundles install information for a single binary.
+type meta struct {
+	install   installFn
+	installed versionFn // detect currently installed version
+	latest    latestFn  // fetch latest available version
 }
 
-// GetLSPMetadata returns metadata for a given language's LSP server.
-// It resolves the latest version dynamically if a VersionResolver is configured.
-func GetLSPMetadata(lang string) (*LSPMetadata, error) {
-	metadata, ok := lspMetadata[lang]
-	if !ok {
-		return nil, fmt.Errorf("no metadata for language: %s", lang)
-	}
-
-	// Clone metadata to avoid modifying the original
-	resolved := &LSPMetadata{
-		Name:            metadata.Name,
-		Version:         metadata.Version,
-		BinaryName:      metadata.BinaryName,
-		DownloadURLs:    make(map[string]string),
-		Checksums:       metadata.Checksums,
-		IsArchive:       metadata.IsArchive,
-		ArchivePath:     metadata.ArchivePath,
-		VersionResolver: metadata.VersionResolver,
-	}
-
-	// Resolve latest version if resolver is configured
-	if metadata.VersionResolver != nil {
-		ctx := context.Background()
-		latestVersion, err := metadata.VersionResolver.ResolveLatestVersion(ctx)
-		if err != nil {
-			log.Printf("[%s] Warning: failed to resolve latest version, using fallback %s: %v",
-				lang, metadata.Version, err)
-		} else {
-			resolved.Version = latestVersion
-			log.Printf("[%s] Resolved latest version: %s", lang, latestVersion)
-		}
-	}
-
-	// Substitute {version} in download URLs
-	for platform, urlTemplate := range metadata.DownloadURLs {
-		resolved.DownloadURLs[platform] = strings.ReplaceAll(urlTemplate, "{version}", resolved.Version)
-	}
-
-	return resolved, nil
-}
-
-// LSP metadata with dynamic version resolution
-var lspMetadata = map[string]*LSPMetadata{
-	"go": {
-		Name:       "gopls",
-		Version:    "v0.21.1", // Fallback version
-		BinaryName: "gopls",
-		DownloadURLs: map[string]string{
-			"linux-amd64":   "https://github.com/golang/tools/releases/download/gopls/{version}/gopls-{version}-linux-amd64.tar.gz",
-			"linux-arm64":   "https://github.com/golang/tools/releases/download/gopls/{version}/gopls-{version}-linux-arm64.tar.gz",
-			"darwin-amd64":  "https://github.com/golang/tools/releases/download/gopls/{version}/gopls-{version}-darwin-amd64.tar.gz",
-			"darwin-arm64":  "https://github.com/golang/tools/releases/download/gopls/{version}/gopls-{version}-darwin-arm64.tar.gz",
-			"windows-amd64": "https://github.com/golang/tools/releases/download/gopls/{version}/gopls-{version}-windows-amd64.zip",
-		},
-		Checksums: map[string]string{
-			"linux-amd64":   "",
-			"linux-arm64":   "",
-			"darwin-amd64":  "",
-			"darwin-arm64":  "",
-			"windows-amd64": "",
-		},
-		IsArchive:       true,
-		ArchivePath:     "gopls",
-		VersionResolver: NewGitHubResolver("golang", "tools", ""),
+// binaryMeta maps binary names to their install metadata.
+var binaryMeta = map[string]meta{
+	"gopls": {
+		install:   goInstall("golang.org/x/tools/gopls@latest"),
+		installed: versionFromArgs("version"),
+		latest:    latestGoModule("golang.org/x/tools/gopls"),
 	},
-	"python": {
-		Name:       "pyright",
-		Version:    "1.1.408", // Fallback version
-		BinaryName: "pyright-langserver",
-		DownloadURLs: map[string]string{
-			"linux-amd64":   "https://registry.npmjs.org/pyright/-/pyright-{version}.tgz",
-			"linux-arm64":   "https://registry.npmjs.org/pyright/-/pyright-{version}.tgz",
-			"darwin-amd64":  "https://registry.npmjs.org/pyright/-/pyright-{version}.tgz",
-			"darwin-arm64":  "https://registry.npmjs.org/pyright/-/pyright-{version}.tgz",
-			"windows-amd64": "https://registry.npmjs.org/pyright/-/pyright-{version}.tgz",
-		},
-		Checksums: map[string]string{
-			"linux-amd64":   "",
-			"linux-arm64":   "",
-			"darwin-amd64":  "",
-			"darwin-arm64":  "",
-			"windows-amd64": "",
-		},
-		IsArchive:       true,
-		ArchivePath:     "package/langserver.index.js",
-		VersionResolver: NewNPMResolver("pyright"),
+	"pylsp": {
+		install:   pipInstall("python-lsp-server"),
+		installed: versionFromArgs("--version"),
+		latest:    latestPipPackage("python-lsp-server"),
 	},
-	"typescript": {
-		Name:       "typescript-language-server",
-		Version:    "5.1.3", // Fallback version
-		BinaryName: "typescript-language-server",
-		DownloadURLs: map[string]string{
-			"linux-amd64":   "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-{version}.tgz",
-			"linux-arm64":   "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-{version}.tgz",
-			"darwin-amd64":  "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-{version}.tgz",
-			"darwin-arm64":  "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-{version}.tgz",
-			"windows-amd64": "https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-{version}.tgz",
-		},
-		Checksums: map[string]string{
-			"linux-amd64":   "",
-			"linux-arm64":   "",
-			"darwin-amd64":  "",
-			"darwin-arm64":  "",
-			"windows-amd64": "",
-		},
-		IsArchive:       true,
-		ArchivePath:     "package/lib/cli.mjs",
-		VersionResolver: NewNPMResolver("typescript-language-server"),
+	"typescript-language-server": {
+		install:   npmInstall("typescript-language-server", "typescript"),
+		installed: versionFromArgs("--version"),
+		latest:    latestNpmPackage("typescript-language-server"),
 	},
-	"lua": {
-		Name:       "lua-language-server",
-		Version:    "3.17.1", // Fallback version
-		BinaryName: "lua-language-server",
-		DownloadURLs: map[string]string{
-			"linux-amd64":   "https://github.com/LuaLS/lua-language-server/releases/download/{version}/lua-language-server-{version}-linux-x64.tar.gz",
-			"linux-arm64":   "https://github.com/LuaLS/lua-language-server/releases/download/{version}/lua-language-server-{version}-linux-arm64.tar.gz",
-			"darwin-amd64":  "https://github.com/LuaLS/lua-language-server/releases/download/{version}/lua-language-server-{version}-darwin-x64.tar.gz",
-			"darwin-arm64":  "https://github.com/LuaLS/lua-language-server/releases/download/{version}/lua-language-server-{version}-darwin-arm64.tar.gz",
-			"windows-amd64": "https://github.com/LuaLS/lua-language-server/releases/download/{version}/lua-language-server-{version}-win32-x64.zip",
-		},
-		Checksums: map[string]string{
-			"linux-amd64":   "",
-			"linux-arm64":   "",
-			"darwin-amd64":  "",
-			"darwin-arm64":  "",
-			"windows-amd64": "",
-		},
-		IsArchive:       true,
-		ArchivePath:     "bin/lua-language-server",
-		VersionResolver: NewGitHubResolver("LuaLS", "lua-language-server", ""),
+	"lua-language-server": {
+		install:   luaLSInstall(),
+		installed: versionFromArgs("--version"),
+		latest:    latestGitHubRelease("LuaLS", "lua-language-server"),
 	},
-	"zig": {
-		Name:       "zls",
-		Version:    "0.15.1", // Fallback version
-		BinaryName: "zls",
-		DownloadURLs: map[string]string{
-			"linux-amd64":   "https://github.com/zigtools/zls/releases/download/{version}/zls-linux-x86_64-{version}.tar.gz",
-			"linux-arm64":   "https://github.com/zigtools/zls/releases/download/{version}/zls-linux-aarch64-{version}.tar.gz",
-			"darwin-amd64":  "https://github.com/zigtools/zls/releases/download/{version}/zls-macos-x86_64-{version}.tar.gz",
-			"darwin-arm64":  "https://github.com/zigtools/zls/releases/download/{version}/zls-macos-aarch64-{version}.tar.gz",
-			"windows-amd64": "https://github.com/zigtools/zls/releases/download/{version}/zls-windows-x86_64-{version}.zip",
-		},
-		Checksums: map[string]string{
-			"linux-amd64":   "",
-			"linux-arm64":   "",
-			"darwin-amd64":  "",
-			"darwin-arm64":  "",
-			"windows-amd64": "",
-		},
-		IsArchive:       true,
-		ArchivePath:     "zls",
-		VersionResolver: NewGitHubResolver("zigtools", "zls", ""),
+	"zls": {
+		install:   zlsInstall(),
+		installed: versionFromArgs("--version"),
+		latest:    latestGitHubRelease("zigtools", "zls"),
 	},
 	"templ": {
-		Name:       "templ",
-		Version:    "v0.3.1001", // Fallback version
-		BinaryName: "templ",
-		DownloadURLs: map[string]string{
-			"linux-x86_64":   "https://github.com/a-h/templ/releases/download/{version}/templ_Linux_x86_64.tar.gz",
-			"linux-arm64":    "https://github.com/a-h/templ/releases/download/{version}/templ_Linux_arm64.tar.gz",
-			"darwin-x86_64":  "https://github.com/a-h/templ/releases/download/{version}/templ_Darwin_x86_64.tar.gz",
-			"darwin-arm64":   "https://github.com/a-h/templ/releases/download/{version}/templ_Darwin_arm64.tar.gz",
-			"windows-x86_64": "https://github.com/a-h/templ/releases/download/{version}/templ_Windows_x86_64.tar.gz",
-			"windows-arm64":  "https://github.com/a-h/templ/releases/download/{version}/templ_Windows_arm64.tar.gz",
-		},
-		Checksums: map[string]string{
-			"linux-x86_64":   "",
-			"linux-arm64":    "",
-			"darwin-x86_64":  "",
-			"darwin-arm64":   "",
-			"windows-x86_64": "",
-			"windows-arm64":  "",
-		},
-		IsArchive:       true,
-		ArchivePath:     "templ",
-		VersionResolver: NewGitHubResolver("a-h", "templ", ""),
+		install:   goInstall("github.com/a-h/templ/cmd/templ@latest"),
+		installed: versionFromArgs("version"),
+		latest:    latestGoModule("github.com/a-h/templ/cmd/templ"),
 	},
 }
 
-// GetLanguageByBinaryName maps a binary name back to its language identifier.
-func GetLanguageByBinaryName(binaryName string) string {
-	for lang, meta := range lspMetadata {
-		if meta.BinaryName == binaryName {
-			return lang
+// Install installs a binary by name and returns the path to the installed binary.
+func Install(ctx context.Context, name string) (string, error) {
+	m, ok := binaryMeta[name]
+	if !ok {
+		return "", fmt.Errorf("pkgmgr: no install recipe for %q", name)
+	}
+	return m.install(ctx, name)
+}
+
+// goInstall returns an installFn that runs `go install <pkg>`.
+func goInstall(pkg string) installFn {
+	return func(ctx context.Context, name string) (string, error) {
+		if err := runCmdCtx(ctx, "go", "install", pkg); err != nil {
+			return "", fmt.Errorf("go install %s: %w", pkg, err)
+		}
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return "", fmt.Errorf("go install %s succeeded but binary not found: %w", pkg, err)
+		}
+		return path, nil
+	}
+}
+
+// pipInstall returns an installFn that runs `pip install <pkg>`.
+func pipInstall(pkg string) installFn {
+	return func(ctx context.Context, name string) (string, error) {
+		pip := "pip3"
+		if runtime.GOOS == "windows" {
+			pip = "pip"
+		}
+		if err := runCmdCtx(ctx, pip, "install", pkg); err != nil {
+			return "", fmt.Errorf("pip install %s: %w", pkg, err)
+		}
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return "", fmt.Errorf("pip install %s succeeded but binary not found: %w", pkg, err)
+		}
+		return path, nil
+	}
+}
+
+// npmInstall returns an installFn that runs `npm install -g <pkgs...>`.
+func npmInstall(pkgs ...string) installFn {
+	return func(ctx context.Context, name string) (string, error) {
+		args := append([]string{"install", "-g"}, pkgs...)
+		if err := runCmdCtx(ctx, "npm", args...); err != nil {
+			return "", fmt.Errorf("npm install %s: %w", strings.Join(pkgs, " "), err)
+		}
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return "", fmt.Errorf("npm install succeeded but binary not found: %w", err)
+		}
+		return path, nil
+	}
+}
+
+// luaLSInstall returns an installFn that downloads lua-language-server from GitHub releases.
+func luaLSInstall() installFn {
+	const releaseURL = "https://github.com/LuaLS/lua-language-server/releases"
+	return func(ctx context.Context, name string) (string, error) {
+		var version string
+		if lf := latestGitHubRelease("LuaLS", "lua-language-server"); lf != nil {
+			if v, err := lf(ctx); err == nil {
+				version = v
+			}
+		}
+		url := luaLSDownloadURL(version)
+		if url == "" {
+			return "", fmt.Errorf(
+				"pkgmgr: cannot auto-install %s on %s/%s — please install manually: %s",
+				name, runtime.GOOS, runtime.GOARCH, releaseURL,
+			)
+		}
+		return downloadBinary(ctx, name, url)
+	}
+}
+
+// zlsInstall returns an installFn that downloads ZLS from GitHub releases.
+func zlsInstall() installFn {
+	return func(ctx context.Context, _ string) (string, error) {
+		var version string
+		if lf := latestGitHubRelease("zigtools", "zls"); lf != nil {
+			if v, err := lf(ctx); err == nil {
+				version = v
+			}
+		}
+		url := zlsDownloadURL(version)
+		if url == "" {
+			return "", fmt.Errorf(
+				"pkgmgr: cannot auto-install zls on %s/%s — please install manually: https://github.com/zigtools/zls/releases",
+				runtime.GOOS, runtime.GOARCH,
+			)
+		}
+		return downloadBinary(ctx, "zls", url)
+	}
+}
+
+// luaLSDownloadURL returns a direct download URL for lua-language-server releases.
+func luaLSDownloadURL(version string) string {
+	const fallback = "3.7.4"
+	if version == "" {
+		version = fallback
+	}
+	osMap := map[string]string{"darwin": "darwin", "linux": "linux", "windows": "win32"}
+	archMap := map[string]string{"amd64": "x64", "arm64": "arm64"}
+	osStr, ok1 := osMap[runtime.GOOS]
+	archStr, ok2 := archMap[runtime.GOARCH]
+	if !ok1 || !ok2 {
+		return ""
+	}
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	return fmt.Sprintf(
+		"https://github.com/LuaLS/lua-language-server/releases/download/%s/lua-language-server-%s-%s-%s.%s",
+		version, version, osStr, archStr, ext,
+	)
+}
+
+// zlsDownloadURL returns a direct download URL for ZLS releases.
+func zlsDownloadURL(version string) string {
+	const fallback = "0.15.1"
+	if version == "" {
+		version = fallback
+	}
+	osMap := map[string]string{"darwin": "macos", "linux": "linux", "windows": "windows"}
+	archMap := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}
+	osStr, ok1 := osMap[runtime.GOOS]
+	archStr, ok2 := archMap[runtime.GOARCH]
+	if !ok1 || !ok2 {
+		return ""
+	}
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	return fmt.Sprintf(
+		"https://github.com/zigtools/zls/releases/download/%s/zls-%s-%s-%s.%s",
+		version, osStr, archStr, version, ext,
+	)
+}
+
+// downloadBinary fetches url (a .tar.gz or .zip archive), extracts the named
+// binary from it, writes it to the install dir, and makes it executable.
+func downloadBinary(ctx context.Context, name, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("pkgmgr: download %s: %w", url, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("pkgmgr: download %s: HTTP %d", url, resp.StatusCode)
+	}
+
+	// Write the archive to a temp file.
+	archiveTmp, err := os.CreateTemp("", "codemap-"+name+"-archive-*")
+	if err != nil {
+		return "", err
+	}
+	archiveName := archiveTmp.Name()
+	defer os.Remove(archiveName) //nolint:errcheck
+
+	if _, err := io.Copy(archiveTmp, resp.Body); err != nil {
+		archiveTmp.Close()
+		return "", fmt.Errorf("pkgmgr: write archive: %w", err)
+	}
+	archiveTmp.Close()
+
+	dest, err := binaryPath(name)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract based on URL suffix.
+	if strings.HasSuffix(url, ".tar.gz") || strings.HasSuffix(url, ".tgz") {
+		if err := extractTarGz(archiveName, name, dest); err != nil {
+			return "", fmt.Errorf("pkgmgr: extract tar.gz: %w", err)
+		}
+	} else if strings.HasSuffix(url, ".zip") {
+		if err := extractZip(archiveName, name, dest); err != nil {
+			return "", fmt.Errorf("pkgmgr: extract zip: %w", err)
+		}
+	} else {
+		return "", fmt.Errorf("pkgmgr: unsupported archive format for %s", url)
+	}
+
+	return dest, nil
+}
+
+// extractTarGz extracts the first file named `binaryName` from a .tar.gz archive.
+func extractTarGz(archivePath, binaryName, destPath string) error {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return fmt.Errorf("gzip: %w", err)
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			continue
+		}
+		if filepath.Base(hdr.Name) != binaryName {
+			continue
+		}
+		return writeExecutable(tr, destPath)
+	}
+	return fmt.Errorf("binary %q not found in archive", binaryName)
+}
+
+// extractZip extracts the first file named `binaryName` from a .zip archive.
+func extractZip(archivePath, binaryName, destPath string) error {
+	zr, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+
+	for _, f := range zr.File {
+		if filepath.Base(f.Name) != binaryName {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer rc.Close()
+		return writeExecutable(rc, destPath)
+	}
+	return fmt.Errorf("binary %q not found in archive", binaryName)
+}
+
+// writeExecutable writes r to destPath with mode 0755, using a temp file + rename for atomicity.
+func writeExecutable(r io.Reader, destPath string) error {
+	tmp, err := os.CreateTemp(filepath.Dir(destPath), "codemap-bin-*")
+	if err != nil {
+		tmp, err = os.CreateTemp("", "codemap-bin-*")
+		if err != nil {
+			return err
 		}
 	}
-	return ""
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) //nolint:errcheck
+
+	if _, err := io.Copy(tmp, r); err != nil {
+		tmp.Close()
+		return err
+	}
+	tmp.Close()
+
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, destPath); err != nil {
+		return copyFile(tmpName, destPath)
+	}
+	return nil
+}
+
+// copyFile copies src to dst with mode 0755.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, in)
+	return err
+}
+
+// runCmdCtx runs an external command, discarding output.
+func runCmdCtx(ctx context.Context, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...) //nolint:gosec
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	return cmd.Run()
 }

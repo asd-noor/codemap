@@ -5,25 +5,23 @@ import (
 	"path/filepath"
 )
 
-// FindGitRoot finds the root of the git repository starting from the current directory.
-// Returns the current directory if .git is not found.
-func FindGitRoot() (string, error) {
-	dir, err := os.Getwd()
+// FindGitRoot walks up from dir until it finds a .git directory or hits the
+// filesystem root. Returns the absolute form of dir itself if no .git is found.
+func FindGitRoot(dir string) string {
+	abs, err := filepath.Abs(dir)
 	if err != nil {
-		return "", err
+		return dir
 	}
-
+	cur := abs
 	for {
-		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-			return dir, nil
+		if _, err := os.Stat(filepath.Join(cur, ".git")); err == nil {
+			return cur
 		}
-
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			// Reached root
-			cwd, _ := os.Getwd()
-			return cwd, nil
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			break
 		}
-		dir = parent
+		cur = parent
 	}
+	return abs
 }

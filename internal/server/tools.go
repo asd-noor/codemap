@@ -14,20 +14,20 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Arguments structs
+// ── Argument structs ──────────────────────────────────────────────────────────
 
 type IndexArgs struct {
-	Force bool `json:"force" jsonschema:"description:Force a full re-index even if no changes are detected"`
+	Force bool `json:"force" jsonschema:"description:Force a full re-index even if one is already in progress"`
 }
 
 type IndexStatusArgs struct{}
 
 type GetSymbolsInFileArgs struct {
-	FilePath string `json:"file_path" jsonschema:"required,description:The absolute path to the file to analyze"`
+	FilePath string `json:"file_path" jsonschema:"required,description:The absolute path to the file to analyse"`
 }
 
 type FindImpactArgs struct {
-	SymbolName string `json:"symbol_name" jsonschema:"required,description:The name of the symbol to analyze for impact"`
+	SymbolName string `json:"symbol_name" jsonschema:"required,description:The name of the symbol to analyse for transitive impact"`
 }
 
 type GetSymbolArgs struct {
@@ -35,265 +35,220 @@ type GetSymbolArgs struct {
 	WithSource bool   `json:"with_source" jsonschema:"description:If true, includes the source code of the symbol in the response"`
 }
 
-func (s *Server) registerTools() {
-	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "index",
-		Description: "Scans the workspace and updates the code graph",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args IndexArgs) (*mcp.CallToolResult, any, error) {
-		cwd, _ := os.Getwd()
-
-		// Check if already indexing
-		s.indexMu.RLock()
-		currentStatus := s.indexStatus
-		s.indexMu.RUnlock()
-		
-		if currentStatus == IndexStatusInProgress {
-			return errorResult("Indexing already in progress"), nil, nil
-		}
-
-		// Reset indexReady channel if this is a re-index
-		if currentStatus == IndexStatusReady || currentStatus == IndexStatusFailed {
-			s.indexMu.Lock()
-			s.indexReady = make(chan struct{})
-			s.indexMu.Unlock()
-		}
-
-		// Run indexing and track status
-		s.setIndexStatus(IndexStatusInProgress, nil)
-		startTime := time.Now()
-
-		nodes, err := s.scanner.Scan(ctx, cwd)
-		if err != nil {
-			s.setIndexStatus(IndexStatusFailed, fmt.Errorf("scan failed: %w", err))
-			return errorResult(fmt.Sprintf("Scan failed: %v", err)), nil, nil
-		}
-
-		// COLLECT VALID FILES
-		validFiles := make(map[string]bool)
-		var validFileList []string
-		for _, n := range nodes {
-			if !validFiles[n.FilePath] {
-				validFiles[n.FilePath] = true
-				validFileList = append(validFileList, n.FilePath)
-			}
-		}
-
-		if err := s.store.BulkUpsertNodes(ctx, nodes); err != nil {
-			s.setIndexStatus(IndexStatusFailed, fmt.Errorf("failed to store nodes: %w", err))
-			return errorResult(fmt.Sprintf("Failed to store nodes: %v", err)), nil, nil
-		}
-
-		// PRUNE STALE DATA
-		if err := s.store.PruneStaleFiles(ctx, validFileList); err != nil {
-			// Log warning but don't fail
-			fmt.Fprintf(os.Stderr, "Warning: Failed to prune stale files: %v\n", err)
-		}
-
-		edges, err := s.lsp.Enrich(ctx, nodes, s.store)
-		if err != nil {
-			s.setIndexStatus(IndexStatusFailed, fmt.Errorf("LSP enrichment failed: %w", err))
-			return errorResult(fmt.Sprintf("Enrich failed: %v", err)), nil, nil
-		}
-
-		if err := s.store.BulkUpsertEdges(ctx, edges); err != nil {
-			s.setIndexStatus(IndexStatusFailed, fmt.Errorf("failed to store edges: %w", err))
-			return errorResult(fmt.Sprintf("Failed to store edges: %v", err)), nil, nil
-		}
-
-		s.setIndexStatus(IndexStatusReady, nil)
-		duration := time.Since(startTime)
-		msg := fmt.Sprintf("Indexed %d nodes and %d edges in %.2fs", len(nodes), len(edges), duration.Seconds())
-		return textResult(msg), nil, nil
-	})
-
-	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "index_status",
-		Description: "Returns the current indexing status of the workspace",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args IndexStatusArgs) (*mcp.CallToolResult, any, error) {
-		status, err, duration := s.GetIndexStatus()
-
-		result := map[string]any{
-			"status": string(status),
-		}
-
-		if duration > 0 {
-			result["duration_seconds"] = duration.Seconds()
-		}
-
-		if err != nil {
-			result["error"] = err.Error()
-		}
-
-		jsonBytes, _ := json.MarshalIndent(result, "", "  ")
-		return textResult(string(jsonBytes)), nil, nil
-	})
-
-	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "get_symbols_in_file",
-		Description: "Returns the structure of a file",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args GetSymbolsInFileArgs) (*mcp.CallToolResult, any, error) {
-		// Wait for initial indexing with timeout
-		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if err := s.WaitForIndex(waitCtx); err != nil {
-			status, indexErr, _ := s.GetIndexStatus()
-			if indexErr != nil {
-				return errorResult(fmt.Sprintf("Indexing failed: %v", indexErr)), nil, nil
-			}
-			if status == IndexStatusInProgress {
-				return errorResult("Indexing in progress, please try again"), nil, nil
-			}
-			return errorResult(fmt.Sprintf("Indexing wait failed: %v", err)), nil, nil
-		}
-
-		nodes, err := s.store.GetSymbolsInFile(ctx, args.FilePath)
-		if err != nil {
-			return errorResult(fmt.Sprintf("Query failed: %v", err)), nil, nil
-		}
-
-		type SimpleNode struct {
-			Name  string `json:"name"`
-			Kind  string `json:"kind"`
-			Range string `json:"range"`
-		}
-		var simple []SimpleNode
-		for _, n := range nodes {
-			simple = append(simple, SimpleNode{
-				Name:  n.Name,
-				Kind:  n.Kind,
-				Range: fmt.Sprintf("%d:%d-%d:%d", n.LineStart, n.ColStart, n.LineEnd, n.ColEnd),
-			})
-		}
-
-		jsonBytes, _ := json.MarshalIndent(simple, "", "  ")
-		return textResult(string(jsonBytes)), nil, nil
-	})
-
-	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "find_impact",
-		Description: "Finds downstream dependents of a symbol",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args FindImpactArgs) (*mcp.CallToolResult, any, error) {
-		// Wait for initial indexing with timeout
-		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if err := s.WaitForIndex(waitCtx); err != nil {
-			status, indexErr, _ := s.GetIndexStatus()
-			if indexErr != nil {
-				return errorResult(fmt.Sprintf("Indexing failed: %v", indexErr)), nil, nil
-			}
-			if status == IndexStatusInProgress {
-				return errorResult("Indexing in progress, please try again"), nil, nil
-			}
-			return errorResult(fmt.Sprintf("Indexing wait failed: %v", err)), nil, nil
-		}
-
-		nodes, err := s.store.FindImpact(ctx, args.SymbolName)
-		if err != nil {
-			return errorResult(fmt.Sprintf("Query failed: %v", err)), nil, nil
-		}
-
-		if len(nodes) == 0 {
-			return textResult("No impacted symbols found."), nil, nil
-		}
-
-		type ImpactNode struct {
-			Name     string `json:"name"`
-			FilePath string `json:"file_path"`
-			Kind     string `json:"kind"`
-		}
-		var impacted []ImpactNode
-		for _, n := range nodes {
-			impacted = append(impacted, ImpactNode{
-				Name:     n.Name,
-				FilePath: n.FilePath,
-				Kind:     n.Kind,
-			})
-		}
-
-		jsonBytes, _ := json.MarshalIndent(impacted, "", "  ")
-		return textResult(string(jsonBytes)), nil, nil
-	})
-
-	mcp.AddTool(s.mcpServer, &mcp.Tool{
-		Name:        "get_symbol",
-		Description: "Finds the location and optionally the source code of a symbol",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, args GetSymbolArgs) (*mcp.CallToolResult, any, error) {
-		// Wait for initial indexing with timeout
-		waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if err := s.WaitForIndex(waitCtx); err != nil {
-			status, indexErr, _ := s.GetIndexStatus()
-			if indexErr != nil {
-				return errorResult(fmt.Sprintf("Indexing failed: %v", indexErr)), nil, nil
-			}
-			if status == IndexStatusInProgress {
-				return errorResult("Indexing in progress, please try again"), nil, nil
-			}
-			return errorResult(fmt.Sprintf("Indexing wait failed: %v", err)), nil, nil
-		}
-
-		nodes, err := s.store.GetSymbolLocation(ctx, args.SymbolName)
-		if err != nil {
-			return errorResult(fmt.Sprintf("Query failed: %v", err)), nil, nil
-		}
-
-		if len(nodes) == 0 {
-			return textResult("Symbol not found."), nil, nil
-		}
-
-		type SymbolInfo struct {
-			graph.Node
-			Source string `json:"source,omitempty"`
-		}
-
-		var info []SymbolInfo
-		for _, n := range nodes {
-			si := SymbolInfo{Node: *n}
-			if args.WithSource {
-				source, err := s.readSource(n.FilePath, n.LineStart, n.LineEnd)
-				if err != nil {
-					// Log warning but return what we have
-					fmt.Fprintf(os.Stderr, "Warning: Failed to read source for %s in %s: %v\n", n.Name, n.FilePath, err)
-				} else {
-					si.Source = source
-				}
-			}
-			info = append(info, si)
-		}
-
-		jsonBytes, _ := json.MarshalIndent(info, "", "  ")
-		return textResult(string(jsonBytes)), nil, nil
-	})
+type GetDiagnosticsArgs struct {
+	FilePath string `json:"file_path" jsonschema:"description:Optional file path to restrict results to a single file"`
+	Severity int    `json:"severity"  jsonschema:"description:Optional minimum severity filter: 1=error 2=warning 3=info 4=hint. Omit or 0 for all."`
 }
 
-func (s *Server) readSource(filePath string, lineStart, lineEnd int) (string, error) {
-	f, err := os.Open(filePath)
+// ── ReadLines ─────────────────────────────────────────────────────────────────
+
+// ReadLines reads lines lineStart..lineEnd (1-indexed, inclusive) from path.
+// Returns an empty string if the file cannot be opened or the range is invalid.
+func ReadLines(path string, lineStart, lineEnd int) string {
+	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return ""
 	}
 	defer f.Close()
 
-	var builder strings.Builder
-	scanner := bufio.NewScanner(f)
-	currentLine := 1
-	first := true
-	for scanner.Scan() {
-		if currentLine >= lineStart && currentLine <= lineEnd {
-			if !first {
-				builder.WriteByte('\n')
-			}
-			builder.Write(scanner.Bytes())
-			first = false
-		}
-		if currentLine > lineEnd {
+	var out strings.Builder
+	sc := bufio.NewScanner(f)
+	line := 1
+	for sc.Scan() {
+		if line > lineEnd {
 			break
 		}
-		currentLine++
+		if line >= lineStart {
+			if out.Len() > 0 {
+				out.WriteByte('\n')
+			}
+			out.WriteString(sc.Text())
+		}
+		line++
 	}
+	return out.String()
+}
 
-	if err := scanner.Err(); err != nil {
-		return "", err
+// ── Helper result builders ────────────────────────────────────────────────────
+
+func textResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}
+}
+
+func errorResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{
+		IsError: true,
+		Content: []mcp.Content{&mcp.TextContent{Text: text}},
 	}
+}
 
-	return builder.String(), nil
+func jsonResult(v any) *mcp.CallToolResult {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to marshal result: %v", err))
+	}
+	return textResult(string(b))
+}
+
+// ── Tool registration ─────────────────────────────────────────────────────────
+
+func (s *Server) registerTools() {
+	srv := mcp.NewServer(&mcp.Implementation{
+		Name:    "codemap",
+		Version: "0.2.0",
+	}, nil)
+	s.mcpSrv = srv
+
+	// index — trigger (re-)index
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "index",
+		Description: "Scans the workspace and builds/refreshes the code graph. Run this after large changes.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args IndexArgs) (*mcp.CallToolResult, any, error) {
+		if err := s.ForceIndex(ctx); err != nil {
+			return errorResult(err.Error()), nil, nil
+		}
+		// Wait for completion (up to 30 s).
+		start := time.Now()
+		if err := s.WaitForIndex(ctx); err != nil {
+			return errorResult(fmt.Sprintf("indexing failed: %v", err)), nil, nil
+		}
+		dur := time.Since(start)
+
+		nodes, _ := s.store.NodeCount(ctx)
+		edges, _ := s.store.EdgeCount(ctx)
+		diags, _ := s.store.DiagnosticCount(ctx)
+		msg := fmt.Sprintf("Indexed %d nodes, %d edges, %d diagnostics in %.2fs",
+			nodes, edges, diags, dur.Seconds())
+		return textResult(msg), nil, nil
+	})
+
+	// index_status — query current index status
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "index_status",
+		Description: "Returns the current indexing status of the workspace",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args IndexStatusArgs) (*mcp.CallToolResult, any, error) {
+		status, dur, err := s.Status()
+		result := map[string]any{
+			"status":   status.String(),
+			"duration": dur.String(),
+		}
+		if err != nil {
+			result["error"] = err.Error()
+		}
+		if status == IndexStatusReady {
+			nodes, _ := s.store.NodeCount(ctx)
+			edges, _ := s.store.EdgeCount(ctx)
+			diags, _ := s.store.DiagnosticCount(ctx)
+			result["nodes"] = nodes
+			result["edges"] = edges
+			result["diagnostics"] = diags
+		}
+		return jsonResult(result), nil, nil
+	})
+
+	// get_symbols_in_file — list all symbols in a file
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "get_symbols_in_file",
+		Description: "Lists all symbols (functions, types, classes, …) defined in a given source file",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args GetSymbolsInFileArgs) (*mcp.CallToolResult, any, error) {
+		if err := s.WaitForIndex(ctx); err != nil {
+			return errorResult(fmt.Sprintf("index not ready: %v", err)), nil, nil
+		}
+		nodes, err := s.store.GetSymbolsInFile(ctx, args.FilePath)
+		if err != nil {
+			return errorResult(fmt.Sprintf("query failed: %v", err)), nil, nil
+		}
+		if len(nodes) == 0 {
+			return textResult(fmt.Sprintf("No symbols found in %s", args.FilePath)), nil, nil
+		}
+		return jsonResult(nodes), nil, nil
+	})
+
+	// find_impact — transitive reverse-dependency analysis
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "find_impact",
+		Description: "Finds all symbols that transitively depend on the given symbol — shows the blast radius of a change",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args FindImpactArgs) (*mcp.CallToolResult, any, error) {
+		if err := s.WaitForIndex(ctx); err != nil {
+			return errorResult(fmt.Sprintf("index not ready: %v", err)), nil, nil
+		}
+		nodes, err := s.store.FindImpact(ctx, args.SymbolName)
+		if err != nil {
+			return errorResult(fmt.Sprintf("query failed: %v", err)), nil, nil
+		}
+		if len(nodes) == 0 {
+			return textResult(fmt.Sprintf("No dependents found for %q", args.SymbolName)), nil, nil
+		}
+		return jsonResult(nodes), nil, nil
+	})
+
+	// get_symbol — locate a symbol across the project (with optional source)
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "get_symbol",
+		Description: "Locates a named symbol across the project, optionally returning its source code",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args GetSymbolArgs) (*mcp.CallToolResult, any, error) {
+		if err := s.WaitForIndex(ctx); err != nil {
+			return errorResult(fmt.Sprintf("index not ready: %v", err)), nil, nil
+		}
+		nodes, err := s.store.GetSymbolLocation(ctx, args.SymbolName)
+		if err != nil {
+			return errorResult(fmt.Sprintf("query failed: %v", err)), nil, nil
+		}
+		if len(nodes) == 0 {
+			return textResult(fmt.Sprintf("Symbol %q not found", args.SymbolName)), nil, nil
+		}
+
+		type nodeWithSource struct {
+			graph.Node
+			Source string `json:"source,omitempty"`
+		}
+		results := make([]nodeWithSource, len(nodes))
+		for i, n := range nodes {
+			nws := nodeWithSource{Node: n}
+			if args.WithSource {
+				nws.Source = ReadLines(n.FilePath, n.LineStart, n.LineEnd)
+			}
+			results[i] = nws
+		}
+		return jsonResult(results), nil, nil
+	})
+
+	// get_diagnostics — return LSP diagnostics from the last index
+	mcp.AddTool(srv, &mcp.Tool{
+		Name:        "get_diagnostics",
+		Description: "Returns LSP diagnostics (errors, warnings, hints) captured during the last index run. Optionally filter by file path or minimum severity.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args GetDiagnosticsArgs) (*mcp.CallToolResult, any, error) {
+		if err := s.WaitForIndex(ctx); err != nil {
+			return errorResult(fmt.Sprintf("index not ready: %v", err)), nil, nil
+		}
+
+		var (
+			diags []graph.Diagnostic
+			err   error
+		)
+		if args.FilePath != "" {
+			diags, err = s.store.GetDiagnosticsForFile(ctx, args.FilePath)
+		} else {
+			diags, err = s.store.GetAllDiagnostics(ctx)
+		}
+		if err != nil {
+			return errorResult(fmt.Sprintf("query failed: %v", err)), nil, nil
+		}
+
+		// Optional severity filter.
+		if args.Severity > 0 {
+			var filtered []graph.Diagnostic
+			for _, d := range diags {
+				if d.Severity <= args.Severity {
+					filtered = append(filtered, d)
+				}
+			}
+			diags = filtered
+		}
+
+		if len(diags) == 0 {
+			return textResult("No diagnostics found"), nil, nil
+		}
+		return jsonResult(diags), nil, nil
+	})
 }

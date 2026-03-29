@@ -1,9 +1,9 @@
+// Package watcher watches a directory tree for file changes and drives
+// incremental re-indexing of the codemap graph.
 package watcher
 
 import (
 	"context"
-	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,246 +11,227 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
-	ignore "github.com/sabhiram/go-gitignore"
+	gitignore "github.com/sabhiram/go-gitignore"
 
 	"codemap/internal/graph"
 	"codemap/internal/lsp"
 	"codemap/internal/scanner"
 )
 
-// Watcher monitors file system changes and triggers re-indexing.
-type Watcher struct {
-	scanner   *scanner.Scanner
-	store     *graph.Store
-	lsp       *lsp.Service
-	watcher   *fsnotify.Watcher
-	root      string
-	gitignore *ignore.GitIgnore
+const (
+	debounceDelay = 500 * time.Millisecond
+	pollInterval  = 100 * time.Millisecond
+	// IdleTimeout is the duration of inactivity after which the watcher stops
+	// itself by cancelling the context via the cancel func passed to Run.
+	IdleTimeout = 5 * time.Minute
+)
 
-	// Debouncing
-	debounceTime time.Duration
-	pendingFiles map[string]time.Time
-	mu           sync.Mutex
+// skipDirs is the set of directory names the watcher never descends into.
+var skipDirs = map[string]struct{}{
+	"vendor":       {},
+	"node_modules": {},
+	"__pycache__":  {},
+	".git":         {},
+	"zig-cache":    {},
+	"zig-out":      {},
 }
 
-// New creates a new file watcher.
-func New(scn *scanner.Scanner, store *graph.Store, lspSvc *lsp.Service, root string) (*Watcher, error) {
+// Watcher watches a project directory tree and fires re-indexing on file changes
+// after debouncing.
+type Watcher struct {
+	rootDir string
+	sc      *scanner.Scanner
+	lspSvc  *lsp.Service
+	store   *graph.Store
+	ignore  *gitignore.GitIgnore
+	inner   *fsnotify.Watcher
+
+	mu         sync.Mutex
+	pending    map[string]time.Time // path → deadline
+	removedSet map[string]struct{}  // paths that were removed/renamed
+}
+
+// New creates a Watcher for rootDir.
+func New(rootDir string, sc *scanner.Scanner, lspSvc *lsp.Service, store *graph.Store) (*Watcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create fsnotify watcher: %w", err)
+		return nil, err
 	}
-
-	// Load gitignore
-	ign, _ := ignore.CompileIgnoreFile(filepath.Join(root, ".gitignore"))
-
+	ig, _ := gitignore.CompileIgnoreFile(filepath.Join(rootDir, ".gitignore"))
 	w := &Watcher{
-		scanner:      scn,
-		store:        store,
-		lsp:          lspSvc,
-		watcher:      fw,
-		root:         root,
-		gitignore:    ign,
-		debounceTime: 500 * time.Millisecond,
-		pendingFiles: make(map[string]time.Time),
+		rootDir:    rootDir,
+		sc:         sc,
+		lspSvc:     lspSvc,
+		store:      store,
+		ignore:     ig,
+		inner:      fw,
+		pending:    make(map[string]time.Time),
+		removedSet: make(map[string]struct{}),
 	}
-
+	// Add the entire directory tree.
+	if err := w.addTree(rootDir); err != nil {
+		fw.Close()
+		return nil, err
+	}
 	return w, nil
 }
 
-// Watch starts watching the directory tree for changes.
-func (w *Watcher) Watch(ctx context.Context) error {
-	// Add all directories to watch recursively
-	if err := w.addDirectoriesRecursively(w.root); err != nil {
-		return fmt.Errorf("failed to add directories: %w", err)
-	}
+// addTree recursively adds all directories under root to the fsnotify watcher.
+func (w *Watcher) addTree(root string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasPrefix(name, ".") {
+			return filepath.SkipDir
+		}
+		if _, ok := skipDirs[name]; ok {
+			return filepath.SkipDir
+		}
+		return w.inner.Add(path)
+	})
+}
 
-	log.Printf("Watching %s for file changes...", w.root)
+// Run starts the event loop. It blocks until ctx is done or the idle timeout
+// elapses. cancel is the CancelFunc for ctx; Run calls it when the idle timer
+// fires so that the parent can detect the shutdown cleanly.
+func (w *Watcher) Run(ctx context.Context, cancel context.CancelFunc) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
 
-	// Start debounce processor
-	go w.processDebounced(ctx)
+	idle := time.NewTimer(IdleTimeout)
+	defer idle.Stop()
 
-	// Process events
 	for {
 		select {
 		case <-ctx.Done():
-			return w.watcher.Close()
+			w.inner.Close()
+			return
 
-		case event, ok := <-w.watcher.Events:
+		case <-idle.C:
+			// No file activity for IdleTimeout — self-terminate.
+			w.inner.Close()
+			cancel()
+			return
+
+		case event, ok := <-w.inner.Events:
 			if !ok {
-				return nil
+				return
 			}
 			w.handleEvent(ctx, event)
 
-		case err, ok := <-w.watcher.Errors:
-			if !ok {
-				return nil
-			}
-			log.Printf("Watcher error: %v", err)
-		}
-	}
-}
+		case <-w.inner.Errors:
+			// Ignore watcher errors.
 
-func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
-	relPath, err := filepath.Rel(w.root, event.Name)
-	if err != nil {
-		return
-	}
-
-	if w.gitignore != nil && w.gitignore.MatchesPath(relPath) {
-		return
-	}
-
-	if !w.isSourceFile(event.Name) {
-		if event.Op&fsnotify.Create != 0 {
-			info, err := os.Stat(event.Name)
-			if err == nil && info.IsDir() {
-				w.addDirectoriesRecursively(event.Name)
-			}
-		}
-		return
-	}
-
-	switch {
-	case event.Op&fsnotify.Write != 0:
-		log.Printf("File modified: %s", relPath)
-		w.debounceFile(event.Name)
-	case event.Op&fsnotify.Create != 0:
-		log.Printf("File created: %s", relPath)
-		w.debounceFile(event.Name)
-	case event.Op&fsnotify.Remove != 0:
-		log.Printf("File deleted: %s", relPath)
-		w.handleFileDeleted(ctx, event.Name)
-	case event.Op&fsnotify.Rename != 0:
-		log.Printf("File renamed: %s", relPath)
-		w.handleFileDeleted(ctx, event.Name)
-	}
-}
-
-func (w *Watcher) debounceFile(path string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.pendingFiles[path] = time.Now().Add(w.debounceTime)
-}
-
-func (w *Watcher) processDebounced(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
 		case <-ticker.C:
-			w.processPendingFiles(ctx)
+			if w.flush(ctx) {
+				// Activity detected — reset the idle timer.
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(IdleTimeout)
+			}
 		}
 	}
 }
 
-func (w *Watcher) processPendingFiles(ctx context.Context) {
-	w.mu.Lock()
-	now := time.Now()
-	var ready []string
+// handleEvent processes a single fsnotify event.
+func (w *Watcher) handleEvent(ctx context.Context, event fsnotify.Event) {
+	path := event.Name
+	if w.ignore != nil {
+		rel, _ := filepath.Rel(w.rootDir, path)
+		if w.ignore.MatchesPath(rel) {
+			return
+		}
+	}
 
-	for path, deadline := range w.pendingFiles {
+	// If a new directory was created, watch its subtree.
+	if event.Has(fsnotify.Create) {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			w.addTree(path) //nolint:errcheck
+			return
+		}
+	}
+
+	removed := event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename)
+
+	w.mu.Lock()
+	if removed {
+		w.removedSet[path] = struct{}{}
+	} else {
+		delete(w.removedSet, path)
+	}
+	w.pending[path] = time.Now().Add(debounceDelay)
+	w.mu.Unlock()
+}
+
+// flush processes all pending files whose debounce deadline has passed.
+// It returns true if at least one file was processed (activity occurred).
+func (w *Watcher) flush(ctx context.Context) bool {
+	now := time.Now()
+	w.mu.Lock()
+	var ready []string
+	var readyRemoved []string
+	for path, deadline := range w.pending {
 		if now.After(deadline) {
 			ready = append(ready, path)
-			delete(w.pendingFiles, path)
+			if _, ok := w.removedSet[path]; ok {
+				readyRemoved = append(readyRemoved, path)
+			}
+			delete(w.pending, path)
+			delete(w.removedSet, path)
 		}
 	}
 	w.mu.Unlock()
 
+	for _, path := range readyRemoved {
+		w.store.DeleteNodesByFile(ctx, path) //nolint:errcheck
+	}
+
+	// Determine non-removed paths.
+	removedSet := make(map[string]struct{}, len(readyRemoved))
+	for _, p := range readyRemoved {
+		removedSet[p] = struct{}{}
+	}
 	for _, path := range ready {
-		if err := w.reindexFile(ctx, path); err != nil {
-			log.Printf("Failed to reindex %s: %v", path, err)
+		if _, ok := removedSet[path]; ok {
+			continue
 		}
+		w.reindexFile(ctx, path)
 	}
+	return len(ready) > 0
 }
 
-func (w *Watcher) reindexFile(ctx context.Context, path string) error {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return w.handleFileDeleted(ctx, path)
+// reindexFile performs the full re-index sequence for a single modified file:
+// delete stale nodes → scan → upsert nodes → enrich → upsert edges.
+func (w *Watcher) reindexFile(ctx context.Context, path string) {
+	// 1. Delete stale nodes (cascade deletes edges).
+	w.store.DeleteNodesByFile(ctx, path) //nolint:errcheck
+
+	// 2. Re-scan with Tree-sitter.
+	nodes, err := w.sc.ScanFile(ctx, path)
+	if err != nil || len(nodes) == 0 {
+		return
 	}
 
-	log.Printf("Re-indexing: %s", path)
-
-	nodes, err := w.scanner.ScanFile(ctx, path)
-	if err != nil {
-		return fmt.Errorf("scan failed: %w", err)
-	}
-
-	if err := w.store.DeleteNodesByFile(ctx, path); err != nil {
-		return fmt.Errorf("delete old nodes failed: %w", err)
-	}
-
+	// 3. Upsert new nodes.
 	if err := w.store.BulkUpsertNodes(ctx, nodes); err != nil {
-		return fmt.Errorf("bulk store nodes failed: %w", err)
+		return
 	}
 
-	edges, err := w.lsp.Enrich(ctx, nodes, w.store)
-	if err != nil {
-		log.Printf("LSP enrichment failed for %s: %v", path, err)
+	// 4. LSP enrichment.
+	edges, err := w.lspSvc.Enrich(ctx, nodes, w.store)
+	if err != nil || len(edges) == 0 {
+		return
 	}
 
-	if err := w.store.BulkUpsertEdges(ctx, edges); err != nil {
-		return fmt.Errorf("bulk store edges failed: %w", err)
-	}
-
-	log.Printf("✓ Re-indexed %s: %d nodes, %d edges", filepath.Base(path), len(nodes), len(edges))
-	return nil
-}
-
-func (w *Watcher) handleFileDeleted(ctx context.Context, path string) error {
-	log.Printf("Removing nodes for deleted file: %s", path)
-	return w.store.DeleteNodesByFile(ctx, path)
-}
-
-func (w *Watcher) addDirectoriesRecursively(root string) error {
-	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		if !info.IsDir() {
-			return nil
-		}
-
-		name := info.Name()
-		if strings.HasPrefix(name, ".") && name != "." {
-			return filepath.SkipDir
-		}
-
-		if name == "node_modules" || name == "vendor" || name == "__pycache__" {
-			return filepath.SkipDir
-		}
-
-		relPath, err := filepath.Rel(w.root, path)
-		if err == nil && w.gitignore != nil && w.gitignore.MatchesPath(relPath) {
-			return filepath.SkipDir
-		}
-
-		if err := w.watcher.Add(path); err != nil {
-			log.Printf("Warning: failed to watch %s: %v", path, err)
-		}
-
-		return nil
-	})
-}
-
-func (w *Watcher) isSourceFile(path string) bool {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
-	case ".go", ".py", ".js", ".ts", ".tsx", ".jsx", ".lua", ".templ":
-		// skip generated Go files
-		base := filepath.Base(path)
-		if strings.HasSuffix(base, "_templ.go") || strings.HasSuffix(base, ".sql.go") || strings.HasSuffix(base, "_string.go") {
-			return false
-		}
-		return true
-	default:
-		return false
-	}
-}
-
-func (w *Watcher) Close() error {
-	return w.watcher.Close()
+	// 5. Upsert edges.
+	w.store.BulkUpsertEdges(ctx, edges) //nolint:errcheck
 }

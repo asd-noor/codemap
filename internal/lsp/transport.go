@@ -1,3 +1,5 @@
+// Package lsp implements the LSP stdio transport: framing messages with the
+// Content-Length header as required by the Language Server Protocol.
 package lsp
 
 import (
@@ -9,57 +11,55 @@ import (
 	"strings"
 )
 
-// ReadMessage reads an LSP message (header + body) from the reader.
-func ReadMessage(r *bufio.Reader) ([]byte, error) {
-	// 1. Read Headers
-	var contentLength int
+// WriteMessage writes a JSON-RPC message to w using LSP header framing.
+func WriteMessage(w io.Writer, msg any) error {
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("lsp: marshal message: %w", err)
+	}
+	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))
+	if _, err := io.WriteString(w, header); err != nil {
+		return fmt.Errorf("lsp: write header: %w", err)
+	}
+	if _, err := w.Write(body); err != nil {
+		return fmt.Errorf("lsp: write body: %w", err)
+	}
+	return nil
+}
+
+// ReadMessage reads one LSP-framed message from r and unmarshals it into v.
+func ReadMessage(r *bufio.Reader, v any) error {
+	// Read headers until the blank line.
+	contentLength := -1
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("lsp: read header: %w", err)
 		}
-		line = strings.TrimSpace(line)
+		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
-			// End of headers
-			break
+			break // end of headers
 		}
-
-		parts := strings.SplitN(line, ": ", 2)
-		if len(parts) == 2 && parts[0] == "Content-Length" {
-			contentLength, err = strconv.Atoi(parts[1])
+		if strings.HasPrefix(line, "Content-Length:") {
+			s := strings.TrimSpace(strings.TrimPrefix(line, "Content-Length:"))
+			n, err := strconv.Atoi(s)
 			if err != nil {
-				return nil, fmt.Errorf("invalid Content-Length: %v", err)
+				return fmt.Errorf("lsp: parse Content-Length: %w", err)
 			}
+			contentLength = n
 		}
 	}
-
-	if contentLength == 0 {
-		return nil, fmt.Errorf("missing or zero Content-Length")
+	if contentLength < 0 {
+		return fmt.Errorf("lsp: missing Content-Length header")
 	}
 
-	// 2. Read Body
 	body := make([]byte, contentLength)
-	_, err := io.ReadFull(r, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read body: %v", err)
+	if _, err := io.ReadFull(r, body); err != nil {
+		return fmt.Errorf("lsp: read body: %w", err)
 	}
 
-	return body, nil
-}
-
-// WriteMessage writes an LSP message to the writer.
-func WriteMessage(w io.Writer, msg interface{}) error {
-	body, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("failed to marshal message: %v", err)
-	}
-
-	header := fmt.Sprintf("Content-Length: %d\r\n\r\n", len(body))
-	if _, err := w.Write([]byte(header)); err != nil {
-		return err
-	}
-	if _, err := w.Write(body); err != nil {
-		return err
+	if err := json.Unmarshal(body, v); err != nil {
+		return fmt.Errorf("lsp: unmarshal body: %w", err)
 	}
 	return nil
 }

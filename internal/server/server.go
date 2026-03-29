@@ -1,173 +1,294 @@
+// Package server wires the codemap engine together: scanning, LSP enrichment,
+// file watching, index lifecycle, and MCP tool exposure.
 package server
 
 import (
 	"context"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
 	"codemap/internal/graph"
 	"codemap/internal/lsp"
+	"codemap/internal/pkgmgr"
 	"codemap/internal/scanner"
+	"codemap/internal/watcher"
+	"codemap/util"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-type IndexStatus string
+// saveDiagnostics drains the LSP service diagnostic cache, converts every
+// entry to graph types, resolves the enclosing symbol node for each diagnostic,
+// and persists everything to the store.
+func (srv *Server) saveDiagnostics(ctx context.Context) error {
+	raw := srv.lspSvc.DrainDiagnostics()
+	for uri, lspDiags := range raw {
+		filePath := util.URIToPath(uri)
 
-const (
-	IndexStatusNotStarted IndexStatus = "not_started"
-	IndexStatusInProgress IndexStatus = "in_progress"
-	IndexStatusReady      IndexStatus = "ready"
-	IndexStatusFailed     IndexStatus = "failed"
-)
+		var diags []graph.Diagnostic
+		var edges []graph.DiagnosticEdge
 
-type Server struct {
-	scanner      *scanner.Scanner
-	store        *graph.Store
-	lsp          *lsp.Service
-	mcpServer    *mcp.Server
-	systemPrompt string
+		for _, d := range lspDiags {
+			line := d.Range.Start.Line + 1     // LSP is 0-indexed
+			col := d.Range.Start.Character + 1 // LSP is 0-indexed
+			gd := graph.Diagnostic{
+				ID:       util.DiagnosticID(filePath, line, col, d.Message),
+				FilePath: filePath,
+				Line:     line,
+				Col:      col,
+				Severity: d.Severity,
+				Code:     d.Code,
+				Source:   d.Source,
+				Message:  d.Message,
+			}
+			diags = append(diags, gd)
 
-	indexStatus    IndexStatus
-	indexError     error
-	indexStartTime time.Time
-	indexEndTime   time.Time
-	indexMu        sync.RWMutex
-	indexReady     chan struct{}
+			// Best-effort: link to the smallest enclosing symbol node.
+			if n, err := srv.store.FindNode(ctx, filePath, line, col); err == nil && n != nil {
+				edges = append(edges, graph.DiagnosticEdge{
+					DiagnosticID: gd.ID,
+					NodeID:       n.ID,
+				})
+			}
+		}
+
+		if err := srv.store.UpsertDiagnosticsForFile(ctx, filePath, diags); err != nil {
+			return fmt.Errorf("upsert diagnostics for %s: %w", filePath, err)
+		}
+		if err := srv.store.BulkUpsertDiagnosticEdges(ctx, edges); err != nil {
+			return fmt.Errorf("upsert diagnostic edges for %s: %w", filePath, err)
+		}
+	}
+	return nil
 }
 
-func New(scn *scanner.Scanner, store *graph.Store, lspSvc *lsp.Service, systemPrompt string) *Server {
-	s := mcp.NewServer(&mcp.Implementation{
-		Name:    "codemap",
-		Version: "0.1.0",
-	}, nil)
+// IndexStatus represents the lifecycle state of the codemap index.
+type IndexStatus int
+
+const (
+	IndexStatusIdle       IndexStatus = iota
+	IndexStatusInProgress             // scanning + enriching
+	IndexStatusReady                  // index complete, queries served
+	IndexStatusFailed                 // scan or enrich error
+)
+
+func (s IndexStatus) String() string {
+	switch s {
+	case IndexStatusIdle:
+		return "idle"
+	case IndexStatusInProgress:
+		return "in_progress"
+	case IndexStatusReady:
+		return "ready"
+	case IndexStatusFailed:
+		return "failed"
+	default:
+		return "unknown"
+	}
+}
+
+const waitForIndexTimeout = 30 * time.Second
+
+// Server holds all codemap engine state.
+type Server struct {
+	rootDir  string
+	store    *graph.Store
+	sc       *scanner.Scanner
+	lspSvc   *lsp.Service
+	mcpSrv    *mcp.Server
+	sysprompt string
+
+	mu         sync.Mutex
+	status     IndexStatus
+	startedAt  time.Time
+	finishedAt time.Time
+	indexErr   error
+	done       chan struct{} // closed when status transitions to Ready or Failed
+	closeOnce  *sync.Once   // guards close(done); replaced alongside done
+}
+
+// New creates and starts a Server for the given project root. The initial
+// index begins immediately in a background goroutine. The file watcher runs
+// until ctx is cancelled.
+func New(ctx context.Context, rootDir string, systemPrompt string) (*Server, error) {
+	return newServer(ctx, rootDir, systemPrompt, func() {})
+}
+
+// NewWatch is like New but passes cancel to the watcher so that the watcher's
+// idle-timeout fires cancel(), unblocking the caller's <-ctx.Done().
+func NewWatch(ctx context.Context, cancel context.CancelFunc, rootDir string, systemPrompt string) (*Server, error) {
+	return newServer(ctx, rootDir, systemPrompt, cancel)
+}
+
+// newServer is the shared constructor used by New and NewWatch.
+func newServer(ctx context.Context, rootDir string, systemPrompt string, cancel context.CancelFunc) (*Server, error) {
+	absRoot := util.FindGitRoot(rootDir)
+
+	store, err := graph.Open(absRoot)
+	if err != nil {
+		return nil, fmt.Errorf("server: open store: %w", err)
+	}
+
+	pm := pkgmgr.New()
+	sc := scanner.New(absRoot)
+	lspSvc := lsp.NewService(absRoot, pm)
 
 	srv := &Server{
-		scanner:      scn,
-		store:        store,
-		lsp:          lspSvc,
-		mcpServer:    s,
-		systemPrompt: systemPrompt,
-		indexStatus:  IndexStatusNotStarted,
-		indexReady:   make(chan struct{}),
+		rootDir:   absRoot,
+		store:     store,
+		sc:        sc,
+		lspSvc:    lspSvc,
+		sysprompt: systemPrompt,
+		status:    IndexStatusIdle,
+		done:      make(chan struct{}),
+		closeOnce: &sync.Once{},
 	}
+
 	srv.registerTools()
 	srv.registerResources()
 	srv.registerPrompts()
-	return srv
-}
 
-func (s *Server) GetIndexStatus() (IndexStatus, error, time.Duration) {
-	s.indexMu.RLock()
-	defer s.indexMu.RUnlock()
-	
-	var duration time.Duration
-	if !s.indexStartTime.IsZero() {
-		if s.indexEndTime.IsZero() {
-			duration = time.Since(s.indexStartTime)
-		} else {
-			duration = s.indexEndTime.Sub(s.indexStartTime)
+	// Start initial full index in the background.
+	go srv.runIndex(ctx)
+
+	// Start file watcher.
+	go func() {
+		w, err := watcher.New(absRoot, sc, lspSvc, store)
+		if err != nil {
+			return
 		}
-	}
-	
-	return s.indexStatus, s.indexError, duration
+		w.Run(ctx, cancel)
+	}()
+
+	return srv, nil
 }
 
-func (s *Server) setIndexStatus(status IndexStatus, err error) {
-	s.indexMu.Lock()
-	defer s.indexMu.Unlock()
-	
-	s.indexStatus = status
-	s.indexError = err
-	
-	if status == IndexStatusInProgress {
-		s.indexStartTime = time.Now()
-	} else if status == IndexStatusReady || status == IndexStatusFailed {
-		s.indexEndTime = time.Now()
-		close(s.indexReady)
-	}
+// Close shuts down the server's resources.
+func (srv *Server) Close() {
+	srv.lspSvc.Close()
+	srv.store.Close() //nolint:errcheck
 }
 
-func (s *Server) WaitForIndex(ctx context.Context) error {
+// Status returns the current index status plus elapsed/total duration and any error.
+func (srv *Server) Status() (IndexStatus, time.Duration, error) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	var dur time.Duration
+	switch srv.status {
+	case IndexStatusInProgress:
+		dur = time.Since(srv.startedAt)
+	case IndexStatusReady, IndexStatusFailed:
+		dur = srv.finishedAt.Sub(srv.startedAt)
+	}
+	return srv.status, dur, srv.indexErr
+}
+
+// WaitForIndex blocks until the index is Ready or Failed (or ctx expires).
+func (srv *Server) WaitForIndex(ctx context.Context) error {
+	srv.mu.Lock()
+	done := srv.done
+	st := srv.status
+	srv.mu.Unlock()
+
+	if st == IndexStatusReady {
+		return nil
+	}
+	if st == IndexStatusFailed {
+		return srv.indexErr
+	}
+
+	timeout := time.NewTimer(waitForIndexTimeout)
+	defer timeout.Stop()
+
 	select {
-	case <-s.indexReady:
-		s.indexMu.RLock()
-		err := s.indexError
-		s.indexMu.RUnlock()
+	case <-done:
+		srv.mu.Lock()
+		err := srv.indexErr
+		srv.mu.Unlock()
 		return err
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-timeout.C:
+		return fmt.Errorf("server: timed out waiting for index")
 	}
 }
 
-func (s *Server) Run(ctx context.Context) error {
-	return s.mcpServer.Run(ctx, &mcp.StdioTransport{})
+// ForceIndex triggers a full re-index. Returns an error if one is already running.
+func (srv *Server) ForceIndex(ctx context.Context) error {
+	srv.mu.Lock()
+	if srv.status == IndexStatusInProgress {
+		srv.mu.Unlock()
+		return fmt.Errorf("server: index already in progress")
+	}
+	// Reset the done channel and its Once for callers waiting on WaitForIndex.
+	srv.done = make(chan struct{})
+	srv.closeOnce = &sync.Once{}
+	srv.mu.Unlock()
+
+	go srv.runIndex(ctx)
+	return nil
 }
 
-func (s *Server) RunInitialIndex(ctx context.Context, projectRoot string) {
-	s.setIndexStatus(IndexStatusInProgress, nil)
-	
-	nodes, err := s.scanner.Scan(ctx, projectRoot)
+// runIndex performs a full scan + enrichment cycle, updating status.
+func (srv *Server) runIndex(ctx context.Context) {
+	srv.mu.Lock()
+	srv.status = IndexStatusInProgress
+	srv.startedAt = time.Now()
+	srv.indexErr = nil
+	done := srv.done
+	once := srv.closeOnce
+	srv.mu.Unlock()
+
+	err := srv.doIndex(ctx)
+
+	srv.mu.Lock()
+	srv.finishedAt = time.Now()
 	if err != nil {
-		s.setIndexStatus(IndexStatusFailed, fmt.Errorf("scan failed: %w", err))
-		return
+		srv.status = IndexStatusFailed
+		srv.indexErr = err
+	} else {
+		srv.status = IndexStatusReady
+	}
+	srv.mu.Unlock()
+
+	once.Do(func() { close(done) })
+}
+
+// doIndex runs the actual scan + enrich + store cycle, including diagnostics.
+func (srv *Server) doIndex(ctx context.Context) error {
+	if err := srv.store.Clear(ctx); err != nil {
+		return fmt.Errorf("clear store: %w", err)
 	}
 
-	// COLLECT VALID FILES
-	validFiles := make(map[string]bool)
-	var validFileList []string
-	for _, n := range nodes {
-		if !validFiles[n.FilePath] {
-			validFiles[n.FilePath] = true
-			validFileList = append(validFileList, n.FilePath)
-		}
-	}
-
-	if err := s.store.BulkUpsertNodes(ctx, nodes); err != nil {
-		s.setIndexStatus(IndexStatusFailed, fmt.Errorf("failed to store nodes: %w", err))
-		return
-	}
-
-	// PRUNE STALE DATA
-	if err := s.store.PruneStaleFiles(ctx, validFileList); err != nil {
-		// Log warning but don't fail
-		fmt.Fprintf(os.Stderr, "Warning: Failed to prune stale files: %v\n", err)
-	}
-
-	edges, err := s.lsp.Enrich(ctx, nodes, s.store)
+	nodes, err := srv.sc.Scan(ctx, srv.rootDir)
 	if err != nil {
-		s.setIndexStatus(IndexStatusFailed, fmt.Errorf("LSP enrichment failed: %w", err))
-		return
+		return fmt.Errorf("scan: %w", err)
 	}
 
-	if err := s.store.BulkUpsertEdges(ctx, edges); err != nil {
-		s.setIndexStatus(IndexStatusFailed, fmt.Errorf("failed to store edges: %w", err))
-		return
+	if err := srv.store.BulkUpsertNodes(ctx, nodes); err != nil {
+		return fmt.Errorf("upsert nodes: %w", err)
 	}
 
-	s.setIndexStatus(IndexStatusReady, nil)
+	edges, err := srv.lspSvc.Enrich(ctx, nodes, srv.store)
+	if err != nil {
+		return fmt.Errorf("enrich: %w", err)
+	}
+
+	if err := srv.store.BulkUpsertEdges(ctx, edges); err != nil {
+		return fmt.Errorf("upsert edges: %w", err)
+	}
+
+	// Persist any LSP diagnostics that arrived during enrichment.
+	if err := srv.saveDiagnostics(ctx); err != nil {
+		return fmt.Errorf("save diagnostics: %w", err)
+	}
+
+	return nil
 }
 
+// Store returns the underlying graph store (for direct queries from tools).
+func (srv *Server) Store() *graph.Store { return srv.store }
 
-func textResult(text string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{
-				Text: text,
-			},
-		},
-	}
-}
-
-func errorResult(text string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			&mcp.TextContent{
-				Text: "ERROR: " + text,
-			},
-		},
-		IsError: true,
-	}
-}
+// MCPServer returns the underlying MCP server for transport binding.
+func (srv *Server) MCPServer() *mcp.Server { return srv.mcpSrv }

@@ -11,7 +11,7 @@ import (
 )
 
 func (s *Server) registerResources() {
-	s.mcpServer.AddResource(&mcp.Resource{
+	s.mcpSrv.AddResource(&mcp.Resource{
 		URI:         "codemap://usage-guidelines",
 		Name:        "Usage Guidelines",
 		Description: "System prompt and usage guidelines for the CodeMap MCP server",
@@ -22,7 +22,7 @@ func (s *Server) registerResources() {
 				{
 					URI:      "codemap://usage-guidelines",
 					MIMEType: "text/markdown",
-					Text:     s.systemPrompt,
+					Text:     s.sysprompt,
 				},
 			},
 		}, nil
@@ -32,7 +32,7 @@ func (s *Server) registerResources() {
 	schemaMap := buildSchemaMap()
 
 	// Register a single resource template that matches codemap://schemas/{tool_name}.
-	s.mcpServer.AddResourceTemplate(&mcp.ResourceTemplate{
+	s.mcpSrv.AddResourceTemplate(&mcp.ResourceTemplate{
 		URITemplate: "codemap://schemas/{tool_name}",
 		Name:        "Tool Schema",
 		Description: "JSON schema for the named tool's arguments",
@@ -57,7 +57,6 @@ func (s *Server) registerResources() {
 }
 
 // buildSchemaMap constructs a map from tool name to its JSON schema string.
-// Schemas are derived from the args structs using jsonschema inference.
 func buildSchemaMap() map[string]string {
 	m := make(map[string]string)
 	addSchema[IndexArgs](m, "index")
@@ -65,6 +64,7 @@ func buildSchemaMap() map[string]string {
 	addSchema[GetSymbolsInFileArgs](m, "get_symbols_in_file")
 	addSchema[FindImpactArgs](m, "find_impact")
 	addSchema[GetSymbolArgs](m, "get_symbol")
+	addSchema[GetDiagnosticsArgs](m, "get_diagnostics")
 	return m
 }
 

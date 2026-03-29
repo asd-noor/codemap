@@ -1,305 +1,221 @@
+// Package scanner walks a project directory, parses source files with
+// Tree-sitter, and extracts named symbol nodes for the codemap graph.
 package scanner
 
 import (
 	"context"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 
-	tslua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
-	tszig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
 	sitter "github.com/tree-sitter/go-tree-sitter"
-	tsgo "github.com/tree-sitter/tree-sitter-go/bindings/go"
-	tsjs "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
-	tspy "github.com/tree-sitter/tree-sitter-python/bindings/go"
-	tsts "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
-	ignore "github.com/sabhiram/go-gitignore"
+	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
+	tree_sitter_zig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
+	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
+	tree_sitter_javascript "github.com/tree-sitter/tree-sitter-javascript/bindings/go"
+	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
+
+	gitignore "github.com/sabhiram/go-gitignore"
 
 	"codemap/internal/graph"
 	"codemap/util"
 )
 
+// langDef binds a Tree-sitter language grammar to its query.
+type langDef struct {
+	lang  *sitter.Language
+	query string
+}
+
+// extToLang maps file extensions to language definitions.
+var extToLang = map[string]langDef{
+	".go":  {lang: sitter.NewLanguage(tree_sitter_go.Language()), query: queries["go"]},
+	".py":  {lang: sitter.NewLanguage(tree_sitter_python.Language()), query: queries["python"]},
+	".js":  {lang: sitter.NewLanguage(tree_sitter_javascript.Language()), query: queries["javascript"]},
+	".jsx": {lang: sitter.NewLanguage(tree_sitter_javascript.Language()), query: queries["javascript"]},
+	".ts":  {lang: sitter.NewLanguage(tree_sitter_typescript.LanguageTypescript()), query: queries["typescript"]},
+	".tsx": {lang: sitter.NewLanguage(tree_sitter_typescript.LanguageTSX()), query: queries["typescript"]},
+	".lua": {lang: sitter.NewLanguage(tree_sitter_lua.Language()), query: queries["lua"]},
+	".zig": {lang: sitter.NewLanguage(tree_sitter_zig.Language()), query: queries["zig"]},
+}
+
+// generatedSuffixes lists file-name suffixes that indicate machine-generated code.
+var generatedSuffixes = []string{
+	"_templ.go",
+	".sql.go",
+	"_string.go",
+}
+
+// skipDirs is the set of directory names always skipped.
+var skipDirs = map[string]struct{}{
+	"vendor":       {},
+	"node_modules": {},
+	"__pycache__":  {},
+	".git":         {},
+	"zig-cache":    {},
+	"zig-out":      {},
+}
+
+// Scanner walks a directory tree and extracts graph nodes via Tree-sitter.
 type Scanner struct {
-	languages map[string]*sitter.Language
-	queries   map[string]*sitter.Query
-	root      string
+	ignore *gitignore.GitIgnore
 }
 
-func New() (*Scanner, error) {
-	s := &Scanner{
-		languages: make(map[string]*sitter.Language),
-		queries:   make(map[string]*sitter.Query),
-	}
+// New creates a Scanner for the given root directory, loading .gitignore if
+// present.
+func New(root string) *Scanner {
+	ig, _ := gitignore.CompileIgnoreFile(filepath.Join(root, ".gitignore"))
+	return &Scanner{ignore: ig}
+}
 
-	// Register languages
-	s.languages["go"] = sitter.NewLanguage(tsgo.Language())
-	s.languages["py"] = sitter.NewLanguage(tspy.Language())
-	s.languages["js"] = sitter.NewLanguage(tsjs.Language())
-	s.languages["jsx"] = sitter.NewLanguage(tsjs.Language())
-	s.languages["ts"] = sitter.NewLanguage(tsts.LanguageTypescript())
-	s.languages["tsx"] = sitter.NewLanguage(tsts.LanguageTSX())
-	s.languages["lua"] = sitter.NewLanguage(tslua.Language())
-	s.languages["zig"] = sitter.NewLanguage(tszig.Language())
+// Scan walks root recursively, returning all discovered nodes.
+func (s *Scanner) Scan(ctx context.Context, root string) ([]graph.Node, error) {
+	var nodes []graph.Node
 
-	// Compile queries
-	for ext, lang := range s.languages {
-		qStr, ok := Queries[getLangKey(ext)]
-		if !ok {
-			continue
-		}
-		q, err := sitter.NewQuery(lang, qStr)
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil, fmt.Errorf("failed to compile query for %s: %w", ext, err)
+			return nil // skip unreadable entries
 		}
-		s.queries[ext] = q
-	}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 
-	return s, nil
+		name := d.Name()
+
+		// Skip hidden directories and well-known skip dirs.
+		if d.IsDir() {
+			if strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			if _, ok := skipDirs[name]; ok {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Skip gitignore-matched paths.
+		if s.ignore != nil {
+			rel, _ := filepath.Rel(root, path)
+			if s.ignore.MatchesPath(rel) {
+				return nil
+			}
+		}
+
+		fileNodes, err := s.ScanFile(ctx, path)
+		if err != nil {
+			return nil // skip unparseable files
+		}
+		nodes = append(nodes, fileNodes...)
+		return nil
+	})
+	return nodes, err
 }
 
-func getLangKey(ext string) string {
-	switch ext {
-	case "go":
-		return "go"
-	case "py":
-		return "python"
-	case "js":
-		return "javascript"
-	case "jsx":
-		return "javascript"
-	case "ts":
-		return "typescript"
-	case "tsx":
-		return "typescript"
-	case "lua":
-		return "lua"
-	case "zig":
-		return "zig"
-	default:
-		return ""
-	}
-}
-
-// ScanFile scans a single file and returns its nodes.
-func (s *Scanner) ScanFile(ctx context.Context, path string) ([]*graph.Node, error) {
-	relPath := path
-	if s.root != "" {
-		if rel, err := filepath.Rel(s.root, path); err == nil {
-			relPath = rel
-		}
-	}
-
-	ext := strings.TrimPrefix(filepath.Ext(path), ".")
-	lang, ok := s.languages[ext]
+// ScanFile parses a single file and returns its symbol nodes.
+// Returns nil, nil for unsupported or generated files.
+func (s *Scanner) ScanFile(ctx context.Context, path string) ([]graph.Node, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	ld, ok := extToLang[ext]
 	if !ok {
-		return nil, fmt.Errorf("unsupported file extension: %s", ext)
+		return nil, nil
+	}
+	if isGenerated(path) {
+		return nil, nil
 	}
 
-	query, ok := s.queries[ext]
-	if !ok {
-		return nil, fmt.Errorf("no query for extension: %s", ext)
-	}
-
-	content, err := os.ReadFile(path)
+	src, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, err
 	}
 
 	parser := sitter.NewParser()
-	parser.SetLanguage(lang)
+	defer parser.Close()
+	if err := parser.SetLanguage(ld.lang); err != nil {
+		return nil, err
+	}
 
-	tree := parser.Parse(content, nil)
+	tree := parser.Parse(src, nil)
 	if tree == nil {
-		return nil, fmt.Errorf("failed to parse file")
+		return nil, nil
 	}
 	defer tree.Close()
 
-	qc := sitter.NewQueryCursor()
-	defer qc.Close()
+	q, qErr := sitter.NewQuery(ld.lang, ld.query)
+	if qErr != nil {
+		return nil, fmt.Errorf("tree-sitter query: %s", qErr.Message)
+	}
+	defer q.Close()
 
-	var nodes []*graph.Node
-	matches := qc.Matches(query, tree.RootNode(), content)
-	captureNames := query.CaptureNames()
+	cursor := sitter.NewQueryCursor()
+	defer cursor.Close()
+	matches := cursor.Matches(q, tree.RootNode(), src)
 
+	absPath, _ := filepath.Abs(path)
+	captureNames := q.CaptureNames()
+
+	var nodes []graph.Node
 	for {
 		match := matches.Next()
 		if match == nil {
 			break
 		}
 
-		var nameNode sitter.Node
-		var defNode sitter.Node
-		var foundName bool
-		var foundDef bool
-		kind := "symbol"
+		var nameNode, defNode *sitter.Node
+		var defKind string
 
-		for _, capture := range match.Captures {
-			switch captureNames[capture.Index] {
-			case "name":
-				nameNode = capture.Node
-				foundName = true
-			case "def":
-				defNode = capture.Node
-				foundDef = true
+		for _, cap := range match.Captures {
+			capName := captureNames[cap.Index]
+			node := cap.Node // value copy
+			if capName == "name" {
+				nameNode = &node
+			} else if strings.HasPrefix(capName, "definition.") {
+				defNode = &node
+				defKind = strings.TrimPrefix(capName, "definition.")
 			}
 		}
 
-		if foundName {
-			name := nameNode.Utf8Text(content)
-			rangeNode := nameNode
-			if foundDef {
-				kind = defNode.Kind()
-				rangeNode = defNode
-			} else if parentNode := nameNode.Parent(); parentNode != nil {
-				kind = parentNode.Kind()
-				rangeNode = *parentNode
-			}
-
-			startPos := nameNode.StartPosition()
-			endPos := rangeNode.EndPosition()
-			nodes = append(nodes, &graph.Node{
-				ID:        util.GenerateNodeID(relPath, name),
-				Name:      name,
-				Kind:      kind,
-				FilePath:  path,
-				LineStart: int(startPos.Row) + 1,
-				LineEnd:   int(endPos.Row) + 1,
-				ColStart:  int(startPos.Column) + 1,
-				ColEnd:    int(endPos.Column) + 1,
-				SymbolURI: util.PathToURI(path),
-			})
+		if nameNode == nil || defNode == nil {
+			continue
 		}
+
+		symbolName := nameNode.Utf8Text(src)
+		if symbolName == "" {
+			continue
+		}
+
+		start := defNode.StartPosition()
+		end := defNode.EndPosition()
+		nameStart := nameNode.StartPosition()
+
+		n := graph.Node{
+			ID:        util.NodeID(absPath, symbolName, defKind),
+			Name:      symbolName,
+			Kind:      defKind,
+			FilePath:  absPath,
+			LineStart: int(start.Row) + 1, // Tree-sitter is 0-indexed
+			LineEnd:   int(end.Row) + 1,
+			ColStart:  int(start.Column) + 1,
+			ColEnd:    int(end.Column) + 1,
+			NameLine:  int(nameStart.Row) + 1,
+			NameCol:   int(nameStart.Column) + 1,
+		}
+		nodes = append(nodes, n)
 	}
 
 	return nodes, nil
 }
 
-func (s *Scanner) Scan(ctx context.Context, root string) ([]*graph.Node, error) {
-	s.root = root
-	var nodes []*graph.Node
-
-	// Load gitignore
-	ign, _ := ignore.CompileIgnoreFile(filepath.Join(root, ".gitignore"))
-
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+// isGenerated reports whether the file name matches a generated-code suffix.
+func isGenerated(path string) bool {
+	base := filepath.Base(path)
+	for _, suf := range generatedSuffixes {
+		if strings.HasSuffix(base, suf) {
+			return true
 		}
-
-		// Skip hidden files and common ignore dirs
-		if strings.HasPrefix(d.Name(), ".") && d.Name() != "." && d.Name() != ".gitignore" {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if d.IsDir() && (d.Name() == "node_modules" || d.Name() == "vendor" || d.Name() == "zig-out") {
-			return filepath.SkipDir
-		}
-
-		// Check gitignore
-		relPath, _ := filepath.Rel(root, path)
-		if ign != nil && ign.MatchesPath(relPath) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		// Check extension
-		ext := strings.TrimPrefix(filepath.Ext(path), ".")
-		lang, ok := s.languages[ext]
-		if !ok {
-			return nil
-		}
-		query, ok := s.queries[ext]
-		if !ok {
-			return nil
-		}
-
-		// Parse
-		content, err := os.ReadFile(path)
-		if err != nil {
-			return nil // Skip unreadable files
-		}
-
-		parser := sitter.NewParser()
-		parser.SetLanguage(lang)
-		tree := parser.Parse(content, nil)
-		if tree == nil {
-			return nil
-		}
-		defer tree.Close()
-
-		rootNode := tree.RootNode()
-		qc := sitter.NewQueryCursor()
-		defer qc.Close()
-
-		matches := qc.Matches(query, rootNode, content)
-		captureNames := query.CaptureNames()
-
-		for {
-			match := matches.Next()
-			if match == nil {
-				break
-			}
-
-			var nameNode sitter.Node
-			var defNode sitter.Node
-			var foundName bool
-			var foundDef bool
-			var kind string = "symbol"
-
-			for _, capture := range match.Captures {
-				cName := captureNames[capture.Index]
-
-				if cName == "name" {
-					nameNode = capture.Node
-					foundName = true
-				} else if cName == "def" {
-					defNode = capture.Node
-					foundDef = true
-				}
-			}
-
-			if foundName {
-				// Extract content
-				name := nameNode.Utf8Text(content)
-
-				// simple kind inference
-				rangeNode := nameNode
-				if foundDef {
-					kind = defNode.Kind()
-					rangeNode = defNode
-				} else if parentNode := nameNode.Parent(); parentNode != nil {
-					kind = parentNode.Kind()
-					rangeNode = *parentNode
-				}
-
-				startPos := nameNode.StartPosition()
-				endPos := rangeNode.EndPosition()
-				node := &graph.Node{
-					ID:        util.GenerateNodeID(relPath, name),
-					Name:      name,
-					Kind:      kind,
-					FilePath:  path, // Store absolute path for LSP compatibility
-					LineStart: int(startPos.Row) + 1,
-					LineEnd:   int(endPos.Row) + 1,
-					ColStart:  int(startPos.Column) + 1,
-					ColEnd:    int(endPos.Column) + 1,
-				}
-				nodes = append(nodes, node)
-			}
-		}
-
-		return nil
-	})
-
-	return nodes, err
+	}
+	return false
 }

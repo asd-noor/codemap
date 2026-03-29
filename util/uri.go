@@ -1,30 +1,23 @@
 package util
 
 import (
+	"net/url"
 	"path/filepath"
 	"strings"
 )
 
+// PathToURI converts an absolute file path to a file:// URI.
 func PathToURI(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return "file://" + path
-	}
-	return "file://" + convertToSlash(abs)
+	abs, _ := filepath.Abs(path)
+	u := &url.URL{Scheme: "file", Path: abs}
+	return u.String()
 }
 
+// URIToPath converts a file:// URI to an absolute file path.
 func URIToPath(uri string) string {
-	if strings.HasPrefix(uri, "file://") {
-		return convertFromSlash(uri[7:])
+	u, err := url.Parse(uri)
+	if err != nil {
+		return strings.TrimPrefix(uri, "file://")
 	}
-	return uri
-}
-
-func convertToSlash(path string) string {
-	// Windows support if needed, but for now standard filepath
-	return filepath.ToSlash(path)
-}
-
-func convertFromSlash(path string) string {
-	return filepath.FromSlash(path)
+	return u.Path
 }

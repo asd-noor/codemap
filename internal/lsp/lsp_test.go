@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"codemap/internal/graph"
+	"codemap/internal/pkgmgr"
 	"codemap/util"
 )
 
@@ -19,12 +20,11 @@ func isCommandAvailable(cmd string) bool {
 }
 
 func TestLSP_BasicWorkflow(t *testing.T) {
-	// Skip if gopls is not available
 	if !isCommandAvailable("gopls") {
 		t.Skip("gopls not available, skipping LSP tests")
 	}
 
-	// Create test directory with Go code
+	// Create test directory with Go code.
 	tmpDir := t.TempDir()
 	mainFile := filepath.Join(tmpDir, "main.go")
 	helperFile := filepath.Join(tmpDir, "helper.go")
@@ -45,7 +45,6 @@ func Helper() {
 	// Does something
 }
 `
-
 	if err := os.WriteFile(mainFile, []byte(mainCode), 0644); err != nil {
 		t.Fatalf("Failed to write main.go: %v", err)
 	}
@@ -53,91 +52,50 @@ func Helper() {
 		t.Fatalf("Failed to write helper.go: %v", err)
 	}
 
-	// Create LSP service
-	svc := NewService()
-	defer svc.Shutdown()
+	// Create LSP service.
+	svc := NewService(tmpDir, pkgmgr.New())
+	defer svc.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	// Start gopls
-	if err := svc.StartClient(ctx, "go", "gopls", []string{"serve"}); err != nil {
-		t.Fatalf("Failed to start gopls: %v", err)
+	// Get the go client (lazily starts gopls).
+	client, err := svc.getClient(ctx, "go")
+	if err != nil {
+		t.Fatalf("Failed to start gopls client: %v", err)
 	}
 
-	client := svc.getClient("go")
-	if client == nil {
-		t.Fatal("Failed to get gopls client")
-	}
-
-	// Open the helper file
+	// Open the helper file.
 	helperURI := util.PathToURI(helperFile)
-	if err := client.DidOpen(ctx, helperURI, "go", helperCode); err != nil {
+	client.mu.Lock()
+	if err := client.didOpen(helperURI, "go", helperCode); err != nil {
+		client.mu.Unlock()
 		t.Fatalf("Failed to open helper.go: %v", err)
 	}
+	client.mu.Unlock()
 
-	// Test GetReferences for Helper function
-	// The Helper function is at line 3 (0-indexed: line 2), column 5
-	refs, err := client.GetReferences(ctx, helperURI, 2, 5, false)
+	// Test references for Helper function (line 3, col 5 in helperCode → 0-indexed: 2, 4).
+	refs, err := client.references(ctx, helperURI, Position{Line: 2, Character: 5})
 	if err != nil {
-		t.Logf("Warning: GetReferences failed: %v (this might be expected if gopls needs time to index)", err)
+		t.Logf("GetReferences failed (gopls may still be indexing): %v", err)
 	} else {
 		t.Logf("Found %d references to Helper", len(refs))
-		// We expect at least 2 references in main.go
-		if len(refs) >= 2 {
-			t.Logf("Successfully found references!")
-		}
 	}
 
-	// Test GetDefinition
+	// Open main file and close both.
 	mainURI := util.PathToURI(mainFile)
-	if err := client.DidOpen(ctx, mainURI, "go", mainCode); err != nil {
-		t.Fatalf("Failed to open main.go: %v", err)
-	}
-
-	// Try to find definition of Helper() call at line 4
-	defs, err := client.GetDefinition(ctx, mainURI, 3, 2)
-	if err != nil {
-		t.Logf("Warning: GetDefinition failed: %v", err)
-	} else {
-		t.Logf("Found %d definitions", len(defs))
-	}
-
-	// Close documents
-	client.DidClose(ctx, helperURI)
-	client.DidClose(ctx, mainURI)
-}
-
-// MockNodeResolver implements NodeResolver for testing
-type MockNodeResolver struct {
-	nodes []*graph.Node
-}
-
-func (m *MockNodeResolver) FindNode(ctx context.Context, path string, line, col int) (*graph.Node, error) {
-	var best *graph.Node
-	for _, n := range m.nodes {
-		if n.FilePath == path {
-			if n.LineStart <= line && n.LineEnd >= line {
-				if best == nil {
-					best = n
-				} else {
-					if n.LineStart >= best.LineStart && n.LineEnd <= best.LineEnd {
-						best = n
-					}
-				}
-			}
-		}
-	}
-	return best, nil
+	client.mu.Lock()
+	client.didOpen(mainURI, "go", mainCode) //nolint:errcheck
+	client.didClose(helperURI)              //nolint:errcheck
+	client.didClose(mainURI)               //nolint:errcheck
+	client.mu.Unlock()
 }
 
 func TestLSP_Enrich(t *testing.T) {
-	// Skip if gopls is not available
 	if !isCommandAvailable("gopls") {
 		t.Skip("gopls not available, skipping LSP tests")
 	}
 
-	// Create test directory with Go code
 	tmpDir := t.TempDir()
 	mainFile := filepath.Join(tmpDir, "main.go")
 	helperFile := filepath.Join(tmpDir, "helper.go")
@@ -152,7 +110,6 @@ func MainFunc() {
 
 func Helper() {}
 `
-
 	if err := os.WriteFile(mainFile, []byte(mainCode), 0644); err != nil {
 		t.Fatalf("Failed to write main.go: %v", err)
 	}
@@ -160,41 +117,47 @@ func Helper() {}
 		t.Fatalf("Failed to write helper.go: %v", err)
 	}
 
-	// Create nodes representing the scanned functions
-	nodes := []*graph.Node{
+	// Open an in-memory store for the test.
+	store, err := graph.Open(tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	// Seed nodes.
+	nodes := []graph.Node{
 		{
-			ID:        "main:MainFunc",
+			ID:        util.NodeID(mainFile, "MainFunc", "function"),
 			Name:      "MainFunc",
-			Kind:      "function_declaration",
+			Kind:      "function",
 			FilePath:  mainFile,
-			LineStart: 3,
-			ColStart:  6,
-			LineEnd:   5,
-			ColEnd:    1,
+			LineStart: 3, LineEnd: 5,
+			ColStart: 1, ColEnd: 1,
+			NameLine: 3, NameCol: 6,
 		},
 		{
-			ID:        "main:Helper",
+			ID:        util.NodeID(helperFile, "Helper", "function"),
 			Name:      "Helper",
-			Kind:      "function_declaration",
+			Kind:      "function",
 			FilePath:  helperFile,
-			LineStart: 3,
-			ColStart:  6,
-			LineEnd:   3,
-			ColEnd:    21,
+			LineStart: 3, LineEnd: 3,
+			ColStart: 1, ColEnd: 16,
+			NameLine: 3, NameCol: 6,
 		},
 	}
 
-	// Create LSP service
-	svc := NewService()
-	defer svc.Shutdown()
+	ctx := context.Background()
+	if err := store.BulkUpsertNodes(ctx, nodes); err != nil {
+		t.Fatalf("Failed to seed nodes: %v", err)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	svc := NewService(tmpDir, pkgmgr.New())
+	defer svc.Close()
+
+	runCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	resolver := &MockNodeResolver{nodes: nodes}
-
-	// Run enrichment
-	edges, err := svc.Enrich(ctx, nodes, resolver)
+	edges, err := svc.Enrich(runCtx, nodes, store)
 	if err != nil {
 		t.Fatalf("Enrich failed: %v", err)
 	}
@@ -203,69 +166,28 @@ func Helper() {}
 	for _, e := range edges {
 		t.Logf("Edge: %s --%s--> %s", e.SourceID, e.Relation, e.TargetID)
 	}
-
-	// Note: The actual edge detection might not work immediately as gopls
-	// needs time to index the workspace. This test mainly verifies that
-	// the enrichment process runs without errors.
 }
 
-func TestHelperFunctions(t *testing.T) {
+func TestExtToLangID(t *testing.T) {
 	tests := []struct {
-		path string
+		ext  string
 		want string
+		ok   bool
 	}{
-		{"test.go", "go"},
-		{"script.py", "python"},
-		{"app.js", "javascript"},
-		{"app.ts", "typescript"},
-		{"component.tsx", "typescript"},
-		{"component.jsx", "javascript"},
-		{"config.lua", "lua"},
-		{"build.zig", "zig"},
-		{"unknown.txt", ""},
+		{".go", "go", true},
+		{".py", "python", true},
+		{".js", "javascript", true},
+		{".ts", "typescript", true},
+		{".tsx", "typescript", true},
+		{".jsx", "javascript", true},
+		{".lua", "lua", true},
+		{".zig", "zig", true},
+		{".txt", "", false},
 	}
-
 	for _, tt := range tests {
-		if got := getLang(tt.path); got != tt.want {
-			t.Errorf("getLang(%q) = %q, want %q", tt.path, got, tt.want)
-		}
-	}
-}
-
-func TestIsDefinitionKind(t *testing.T) {
-	tests := []struct {
-		kind string
-		want bool
-	}{
-		{"function_declaration", true},
-		{"method_definition", true},
-		{"class_definition", true},
-		{"interface_declaration", true},
-		{"variable_declaration", false},
-		{"unknown", false},
-	}
-
-	for _, tt := range tests {
-		if got := isDefinitionKind(tt.kind); got != tt.want {
-			t.Errorf("isDefinitionKind(%q) = %v, want %v", tt.kind, got, tt.want)
-		}
-	}
-}
-
-func TestIsInterfaceKind(t *testing.T) {
-	tests := []struct {
-		kind string
-		want bool
-	}{
-		{"interface_declaration", true},
-		{"protocol_declaration", true},
-		{"class_definition", false},
-		{"function_declaration", false},
-	}
-
-	for _, tt := range tests {
-		if got := isInterfaceKind(tt.kind); got != tt.want {
-			t.Errorf("isInterfaceKind(%q) = %v, want %v", tt.kind, got, tt.want)
+		got, ok := extToLangID[tt.ext]
+		if ok != tt.ok || got != tt.want {
+			t.Errorf("extToLangID[%q] = %q, %v; want %q, %v", tt.ext, got, ok, tt.want, tt.ok)
 		}
 	}
 }

@@ -1,83 +1,68 @@
+// Package lsp contains the JSON-RPC 2.0 and LSP protocol structs used by the
+// codemap LSP client.
 package lsp
 
-// JSON-RPC 2.0 Types
+// -------------------------------------------------------------------
+// JSON-RPC 2.0
+// -------------------------------------------------------------------
 
-type Request struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Method  string      `json:"method"`
-	Params  interface{} `json:"params,omitempty"`
+// RequestMessage is an outgoing JSON-RPC request.
+type RequestMessage struct {
+	JSONRPC string `json:"jsonrpc"`
+	ID      int    `json:"id"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
 }
 
-type Response struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      int         `json:"id"`
-	Result  interface{} `json:"result,omitempty"`
-	Error   *RPCError   `json:"error,omitempty"`
+// NotificationMessage is an outgoing JSON-RPC notification (no ID).
+type NotificationMessage struct {
+	JSONRPC string `json:"jsonrpc"`
+	Method  string `json:"method"`
+	Params  any    `json:"params,omitempty"`
 }
 
-type RPCError struct {
-	Code    int         `json:"code"`
-	Message string      `json:"message"`
-	Data    interface{} `json:"data,omitempty"`
+// ResponseMessage is an incoming JSON-RPC response.
+type ResponseMessage struct {
+	JSONRPC string         `json:"jsonrpc"`
+	ID      *int           `json:"id"`
+	Result  any            `json:"result,omitempty"`
+	Error   *ResponseError `json:"error,omitempty"`
 }
 
-// LSP Types
-
-type InitializeParams struct {
-	ProcessID    int                `json:"processId,omitempty"`
-	RootURI      string             `json:"rootUri,omitempty"`
-	Capabilities ClientCapabilities `json:"capabilities"`
+// ResponseError represents a JSON-RPC error object.
+type ResponseError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }
 
-type ClientCapabilities struct {
-	// Minimal for now
-}
+// -------------------------------------------------------------------
+// LSP types
+// -------------------------------------------------------------------
 
-type InitializeResult struct {
-	Capabilities ServerCapabilities `json:"capabilities"`
-}
-
-type ServerCapabilities struct {
-	ReferencesProvider bool `json:"referencesProvider,omitempty"`
-	// Add others as needed
-}
-
-type ReferenceParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     Position               `json:"position"`
-	Context      ReferenceContext       `json:"context"`
-}
-
-type ReferenceContext struct {
-	IncludeDeclaration bool `json:"includeDeclaration"`
-}
-
-type TextDocumentIdentifier struct {
-	URI string `json:"uri"`
-}
-
+// Position is a zero-based line + character offset.
 type Position struct {
 	Line      int `json:"line"`
 	Character int `json:"character"`
 }
 
-type Location struct {
-	URI   string `json:"uri"`
-	Range Range  `json:"range"`
-}
-
+// Range is a span in a text document.
 type Range struct {
 	Start Position `json:"start"`
 	End   Position `json:"end"`
 }
 
-// Document Synchronization Types
-
-type DidOpenTextDocumentParams struct {
-	TextDocument TextDocumentItem `json:"textDocument"`
+// Location is a URI + range pair.
+type Location struct {
+	URI   string `json:"uri"`
+	Range Range  `json:"range"`
 }
 
+// TextDocumentIdentifier identifies a document by URI.
+type TextDocumentIdentifier struct {
+	URI string `json:"uri"`
+}
+
+// TextDocumentItem is used in didOpen.
 type TextDocumentItem struct {
 	URI        string `json:"uri"`
 	LanguageID string `json:"languageId"`
@@ -85,88 +70,91 @@ type TextDocumentItem struct {
 	Text       string `json:"text"`
 }
 
-type DidChangeTextDocumentParams struct {
-	TextDocument   VersionedTextDocumentIdentifier  `json:"textDocument"`
-	ContentChanges []TextDocumentContentChangeEvent `json:"contentChanges"`
+// -------------------------------------------------------------------
+// Initialize
+// -------------------------------------------------------------------
+
+// InitializeParams is the parameter object for the initialize request.
+type InitializeParams struct {
+	ProcessID    int                `json:"processId"`
+	RootURI      string             `json:"rootUri"`
+	Capabilities ClientCapabilities `json:"capabilities"`
 }
 
-type VersionedTextDocumentIdentifier struct {
-	URI     string `json:"uri"`
-	Version int    `json:"version"`
+// ClientCapabilities is intentionally minimal.
+type ClientCapabilities struct{}
+
+// InitializeResult is the server's response to initialize.
+type InitializeResult struct {
+	Capabilities ServerCapabilities `json:"capabilities"`
 }
 
-type TextDocumentContentChangeEvent struct {
-	Text string `json:"text"`
+// ServerCapabilities contains the fields we care about.
+type ServerCapabilities struct {
+	ReferencesProvider     bool `json:"referencesProvider"`
+	ImplementationProvider bool `json:"implementationProvider"`
 }
 
+// -------------------------------------------------------------------
+// textDocument/didOpen
+// -------------------------------------------------------------------
+
+// DidOpenTextDocumentParams is the parameter for textDocument/didOpen.
+type DidOpenTextDocumentParams struct {
+	TextDocument TextDocumentItem `json:"textDocument"`
+}
+
+// -------------------------------------------------------------------
+// textDocument/didClose
+// -------------------------------------------------------------------
+
+// DidCloseTextDocumentParams is the parameter for textDocument/didClose.
 type DidCloseTextDocumentParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 }
 
-// Definition Types
+// -------------------------------------------------------------------
+// textDocument/references
+// -------------------------------------------------------------------
 
-type DefinitionParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     Position               `json:"position"`
+// ReferenceContext is used in ReferencesParams.
+type ReferenceContext struct {
+	IncludeDeclaration bool `json:"includeDeclaration"`
 }
 
-// Implementation Types
+// ReferencesParams is the parameter for textDocument/references.
+type ReferencesParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+	Position     Position               `json:"position"`
+	Context      ReferenceContext       `json:"context"`
+}
 
+// -------------------------------------------------------------------
+// textDocument/implementation
+// -------------------------------------------------------------------
+
+// ImplementationParams is the parameter for textDocument/implementation.
 type ImplementationParams struct {
 	TextDocument TextDocumentIdentifier `json:"textDocument"`
 	Position     Position               `json:"position"`
 }
 
-// Hover Types
+// -------------------------------------------------------------------
+// textDocument/publishDiagnostics  (server → client notification)
+// -------------------------------------------------------------------
 
-type HoverParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-	Position     Position               `json:"position"`
+// Diagnostic is a single LSP diagnostic entry.
+type Diagnostic struct {
+	Range    Range  `json:"range"`
+	Severity int    `json:"severity"` // 1=error 2=warning 3=info 4=hint
+	Code     string `json:"code"`
+	Source   string `json:"source"`
+	Message  string `json:"message"`
 }
 
-type Hover struct {
-	Contents MarkupContent `json:"contents"`
-	Range    *Range        `json:"range,omitempty"`
+// PublishDiagnosticsParams is the parameter object for
+// textDocument/publishDiagnostics notifications.
+type PublishDiagnosticsParams struct {
+	URI         string       `json:"uri"`
+	Diagnostics []Diagnostic `json:"diagnostics"`
 }
-
-type MarkupContent struct {
-	Kind  string `json:"kind"`
-	Value string `json:"value"`
-}
-
-// Document Symbol Types
-
-type DocumentSymbolParams struct {
-	TextDocument TextDocumentIdentifier `json:"textDocument"`
-}
-
-type DocumentSymbol struct {
-	Name           string           `json:"name"`
-	Detail         string           `json:"detail,omitempty"`
-	Kind           int              `json:"kind"`
-	Range          Range            `json:"range"`
-	SelectionRange Range            `json:"selectionRange"`
-	Children       []DocumentSymbol `json:"children,omitempty"`
-}
-
-// Symbol Kinds
-const (
-	SymbolKindFile        = 1
-	SymbolKindModule      = 2
-	SymbolKindNamespace   = 3
-	SymbolKindPackage     = 4
-	SymbolKindClass       = 5
-	SymbolKindMethod      = 6
-	SymbolKindProperty    = 7
-	SymbolKindField       = 8
-	SymbolKindConstructor = 9
-	SymbolKindEnum        = 10
-	SymbolKindInterface   = 11
-	SymbolKindFunction    = 12
-	SymbolKindVariable    = 13
-	SymbolKindConstant    = 14
-	SymbolKindString      = 15
-	SymbolKindNumber      = 16
-	SymbolKindBoolean     = 17
-	SymbolKindArray       = 18
-)

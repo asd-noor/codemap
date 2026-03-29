@@ -6,23 +6,21 @@ import (
 	"path/filepath"
 	"testing"
 
-	"codemap/internal/db"
 	"codemap/internal/graph"
 	"codemap/internal/scanner"
 )
 
 func TestIntegration_ReindexAndQuery(t *testing.T) {
-	// 1. Setup Temp DB
-	tmpDbPath := filepath.Join(t.TempDir(), "test.db")
-	database, err := db.New(tmpDbPath)
-	if err != nil {
-		t.Fatalf("Failed to init DB: %v", err)
-	}
-	defer database.Close()
-	store := graph.NewStore(database)
-
-	// 2. Setup Temp Workspace with Polyglot Code
+	// 1. Setup Temp DB within a temp dir (graph.Open creates .ctxhub/ inside it).
 	wsDir := t.TempDir()
+
+	store, err := graph.Open(wsDir)
+	if err != nil {
+		t.Fatalf("Failed to open store: %v", err)
+	}
+	defer store.Close()
+
+	// 2. Setup Temp Workspace with Polyglot Code.
 	createFile(t, wsDir, "main.go", `package main
 func MainFunc() {
 	Helper()
@@ -58,86 +56,72 @@ end
 
 local function LocalFunc()
 end
-
-MyTable = {}
-MyTable.Method = function() end
 `)
 
-	// 3. Init Scanner
-	scn, err := scanner.New()
-	if err != nil {
-		t.Fatalf("Failed to init scanner: %v", err)
-	}
+	// 3. Init Scanner.
+	scn := scanner.New(wsDir)
 
-	// 4. Run Scan
+	// 4. Run Scan.
 	nodes, err := scn.Scan(context.Background(), wsDir)
 	if err != nil {
 		t.Fatalf("Scan failed: %v", err)
 	}
 
-	// 5. Store Nodes
-	for _, n := range nodes {
-		if err := store.UpsertNode(context.Background(), n); err != nil {
-			t.Fatalf("Upsert failed: %v", err)
-		}
+	// 5. Store Nodes.
+	if err := store.BulkUpsertNodes(context.Background(), nodes); err != nil {
+		t.Fatalf("BulkUpsertNodes failed: %v", err)
 	}
 
-	// 6. Verify Queries
+	ctx := context.Background()
 
-	// Check Go Symbol
-	locs, err := store.GetSymbolLocation(context.Background(), "MainFunc")
+	// 6. Verify Queries.
+
+	// Check Go symbols.
+	locs, err := store.GetSymbolLocation(ctx, "MainFunc")
 	if err != nil {
 		t.Fatalf("GetSymbolLocation failed: %v", err)
 	}
 	if len(locs) != 1 {
 		t.Errorf("Expected 1 location for MainFunc, got %d", len(locs))
-	} else {
-		if locs[0].Kind != "function_declaration" {
-			t.Errorf("Expected kind function_declaration, got %s", locs[0].Kind)
-		}
+	} else if locs[0].Kind != "function" {
+		t.Errorf("Expected kind function, got %s", locs[0].Kind)
 	}
 
-	// Check Python Symbol
-	locs, err = store.GetSymbolLocation(context.Background(), "MyClass")
+	// Check Python symbol.
+	locs, err = store.GetSymbolLocation(ctx, "MyClass")
 	if err != nil {
 		t.Fatalf("GetSymbolLocation failed: %v", err)
 	}
 	if len(locs) != 1 {
 		t.Errorf("Expected 1 location for MyClass, got %d", len(locs))
-	} else {
-		if locs[0].Kind != "class_definition" {
-			t.Errorf("Expected kind class_definition, got %s", locs[0].Kind)
-		}
+	} else if locs[0].Kind != "class" {
+		t.Errorf("Expected kind class, got %s", locs[0].Kind)
 	}
 
-	// Check TS Symbol
-	locs, err = store.GetSymbolLocation(context.Background(), "User")
+	// Check TS interface.
+	locs, err = store.GetSymbolLocation(ctx, "User")
 	if err != nil {
 		t.Fatalf("GetSymbolLocation failed: %v", err)
 	}
 	if len(locs) != 1 {
 		t.Errorf("Expected 1 location for User, got %d", len(locs))
-	} else {
-		if locs[0].Kind != "interface_declaration" {
-			t.Errorf("Expected kind interface_declaration, got %s", locs[0].Kind)
-		}
+	} else if locs[0].Kind != "interface" {
+		t.Errorf("Expected kind interface, got %s", locs[0].Kind)
 	}
 
-	// Check JS Method
-	locs, err = store.GetSymbolLocation(context.Background(), "log")
+	// Check JS method.
+	locs, err = store.GetSymbolLocation(ctx, "log")
 	if err != nil {
 		t.Fatalf("GetSymbolLocation failed: %v", err)
 	}
 	if len(locs) != 1 {
 		t.Errorf("Expected 1 location for log, got %d", len(locs))
-	} else {
-		if locs[0].Kind != "method_definition" {
-			t.Errorf("Expected kind method_definition, got %s", locs[0].Kind)
-		}
+	} else if locs[0].Kind != "method" {
+		t.Errorf("Expected kind method, got %s", locs[0].Kind)
 	}
 
-	// Check Lua Symbol
-	locs, err = store.GetSymbolLocation(context.Background(), "GlobalFunc")
+	// Check Lua symbols.
+	locs, err = store.GetSymbolLocation(ctx, "GlobalFunc")
 	if err != nil {
 		t.Fatalf("GetSymbolLocation failed: %v", err)
 	}
@@ -145,7 +129,7 @@ MyTable.Method = function() end
 		t.Errorf("Expected 1 location for GlobalFunc, got %d", len(locs))
 	}
 
-	locs, err = store.GetSymbolLocation(context.Background(), "LocalFunc")
+	locs, err = store.GetSymbolLocation(ctx, "LocalFunc")
 	if err != nil {
 		t.Fatalf("GetSymbolLocation failed: %v", err)
 	}
@@ -153,9 +137,11 @@ MyTable.Method = function() end
 		t.Errorf("Expected 1 location for LocalFunc, got %d", len(locs))
 	}
 
-	// 7. Verify File Map
+	// 7. Verify file map.
 	scriptPath := filepath.Join(wsDir, "script.py")
-	fileNodes, err := store.GetSymbolsInFile(context.Background(), scriptPath)
+	// ScanFile returns absolute paths, resolve to match.
+	scriptPath, _ = filepath.Abs(scriptPath)
+	fileNodes, err := store.GetSymbolsInFile(ctx, scriptPath)
 	if err != nil {
 		t.Fatalf("GetSymbolsInFile failed: %v", err)
 	}
@@ -165,6 +151,7 @@ MyTable.Method = function() end
 }
 
 func createFile(t *testing.T, dir, name, content string) {
+	t.Helper()
 	err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
 	if err != nil {
 		t.Fatal(err)

@@ -8,7 +8,7 @@ import (
 )
 
 func (s *Server) registerPrompts() {
-	s.mcpServer.AddPrompt(&mcp.Prompt{
+	s.mcpSrv.AddPrompt(&mcp.Prompt{
 		Name:        "analyze-impact",
 		Description: "Analyzes the potential impact of modifying a symbol",
 		Arguments: []*mcp.PromptArgument{
@@ -33,7 +33,7 @@ func (s *Server) registerPrompts() {
 		}, nil
 	})
 
-	s.mcpServer.AddPrompt(&mcp.Prompt{
+	s.mcpSrv.AddPrompt(&mcp.Prompt{
 		Name:        "explore-file",
 		Description: "Explores the structure and symbols of a file",
 		Arguments: []*mcp.PromptArgument{
@@ -58,7 +58,7 @@ func (s *Server) registerPrompts() {
 		}, nil
 	})
 
-	s.mcpServer.AddPrompt(&mcp.Prompt{
+	s.mcpSrv.AddPrompt(&mcp.Prompt{
 		Name:        "locate-and-explain",
 		Description: "Locates a symbol and explains its context in the file",
 		Arguments: []*mcp.PromptArgument{
@@ -83,7 +83,7 @@ func (s *Server) registerPrompts() {
 		}, nil
 	})
 
-	s.mcpServer.AddPrompt(&mcp.Prompt{
+	s.mcpSrv.AddPrompt(&mcp.Prompt{
 		Name:        "re-index-workspace",
 		Description: "Triggers a re-index of the workspace to refresh the code graph",
 	}, func(ctx context.Context, req *mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
