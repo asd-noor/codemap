@@ -1,862 +1,402 @@
 # CodeMap
 
-> A high-performance semantic code graph server for AI agents
+> Semantic code-graph engine — MCP server and CLI
 
-CodeMap is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server that builds and maintains a real-time semantic graph of your codebase. It combines rapid AST parsing with Language Server Protocol integration to provide AI agents with deep code understanding, dependency tracking, and impact analysis.
+CodeMap builds and maintains a real-time semantic graph of your codebase using Tree-sitter AST parsing and Language Server Protocol enrichment. It exposes the graph both as an **MCP server** (for AI agents) and as a **human-friendly CLI**.
+
+---
 
 ## Features
 
-🚀 **Automatic Code Graph Generation**
-- Tree-sitter AST parsing for Go, Python, JavaScript, TypeScript, Lua, and Zig
-- LSP integration for cross-file reference resolution
-- Real-time graph updates via file watching
+- **Multi-language AST parsing** — Go, Python, JavaScript, TypeScript, Lua, Zig, Templ
+- **LSP enrichment** — cross-file references and interface implementations via gopls, pylsp, typescript-language-server, lua-language-server, zls, templ lsp
+- **Real-time updates** — file watcher with 500 ms debounce; background daemon with 5-minute idle timeout
+- **LSP diagnostics** — errors, warnings, hints captured during indexing and queryable
+- **Persistent graph** — SQLite with WAL mode, recursive CTEs for dependency traversal
+- **Auto-install LSPs** — missing language servers are downloaded on first use to `~/.cache/codemap/`; silent background upgrades on subsequent runs
+- **MCP server** — 6 tools, 4 prompts, 2 resource endpoints over stdio
+- **CLI** — 8 subcommands with `--json` output and tabwriter-formatted tables
 
-⚡ **High Performance**
-- Incremental updates (~100ms per file vs 1-2s full scan)
-- SQLite with recursive CTEs for efficient graph traversal
-- Async LSP initialization with adaptive waiting
+---
 
-🎯 **Production Ready**
-- Zero configuration - just run it
-- Graceful error handling with actionable messages
-- Hard LSP validation prevents incomplete data
-- 500ms debouncing for rapid file changes
+## Installation
 
-🔍 **AI-Friendly**
-- MCP protocol for seamless AI agent integration
-- 4 powerful tools for code analysis
-- 4 specialized prompts for common tasks
-- Always up-to-date graph (auto re-indexes on save)
+```bash
+git clone https://github.com/yourusername/codemap.git
+cd codemap
+go build -o codemap .
+```
+
+> **Go 1.25.6+** required. CGo must be available (needed by the Tree-sitter grammars and the templ parser).
+
+Place the resulting `codemap` binary somewhere on your `$PATH`.
+
+---
 
 ## Quick Start
 
-### Prerequisites
-
-1. Install [mise-en-place](https://mise.jdx.dev/) (recommended for managing tools and tasks).
-2. **Language servers are auto-downloaded** - CodeMap will automatically download and cache LSP servers when needed in `~/.cache/codemap/packages/`. No manual installation required!
-
-**Architecture Highlight:** CodeMap uses a **portable package manager** inspired by mason.nvim:
-- All LSPs installed in `~/.cache/codemap/packages/` (isolated, versioned)
-- Unified `bin/` directory automatically added to PATH
-- **No system pollution** - never creates `~/go` or modifies system directories
-- Respects `$CODEMAP_HOME` for custom install locations
-
-**Optional:** If you prefer to use your own LSP installations, you can install them manually:
+### As an MCP Server
 
 ```bash
-# Go
-go install golang.org/x/tools/gopls@latest
+# Run in your project directory (indexes on startup, watches for changes)
+cd /path/to/project
+codemap serve
 
-# Python
-pip install pyright
-
-# TypeScript/JavaScript
-npm install -g typescript-language-server typescript
-
-# Lua (macOS)
-brew install lua-language-server
-
-# Zig (macOS)
-brew install zls
+# Or specify the project root explicitly
+codemap --project-dir /path/to/project serve
 ```
 
-CodeMap will automatically detect and use system-installed language servers before downloading. The search priority is:
-
-1. System PATH
-2. CodeMap package manager (auto-download if not found)
-
-### Installation
-
-```bash
-# Clone and build
-git clone https://github.com/yourusername/codemap.git
-cd codemap
-
-# Using mise (recommended)
-mise run build
-
-# Or using standard Go
-go build -o codemap main.go
-
-# Run
-./codemap
-```
-
-That's it! CodeMap will:
-1. Initialize the portable package manager (`~/.cache/codemap/`)
-2. Auto-download any missing LSP servers (on first use)
-3. Index your workspace (1-2 seconds)
-4. Start watching for file changes
-5. Launch the MCP server on stdio
-
-**Package Manager:** All LSPs are installed in `~/.cache/codemap/packages/<name>/<version>/` with executables symlinked to `~/.cache/codemap/bin/`. This ensures complete isolation from system directories.
-
-## Usage
-
-### Running CodeMap
-
-```bash
-# Simply run in your project directory
-cd /path/to/your/project
-/path/to/codemap
-
-# Or specify the project directory
-/path/to/codemap --project-dir /path/to/your/project
-
-# Or via mise
-mise run run
-
-# Output:
-# Indexing workspace: /path/to/your/project
-# Initial index complete: 47 nodes, 23 edges
-# Watching /path/to/your/project for file changes...
-# Starting MCP server on stdio...
-```
-
-### MCP Configuration
-
-Add to your MCP client configuration:
-
-```json
-{
-  "mcpServers": {
-    "codemap": {
-      "command": "/path/to/codemap"
-    }
-  }
-}
-```
-
-For Claude Desktop (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Add to your MCP client configuration (e.g. Claude Desktop):
 
 ```json
 {
   "mcpServers": {
     "codemap": {
       "command": "/absolute/path/to/codemap",
-      "args": []
+      "args": ["--project-dir", "/absolute/path/to/project"]
     }
   }
 }
 ```
 
-### Package Manager
+`serve` is also the **default command** — running `codemap` with no subcommand starts the MCP server.
 
-CodeMap includes a **portable package manager** inspired by mason.nvim for managing LSP servers:
+### As a CLI
 
-**Directory Structure:**
-```
-~/.cache/codemap/  (or $CODEMAP_HOME)
-├── bin/                    # Unified executables (added to PATH)
-├── packages/               # Installed LSP servers (versioned)
-│   ├── gopls/
-│   │   ├── v0.21.1/
-│   │   └── current -> v0.21.1
-│   ├── pyright/
-│   └── ...
-├── registry/               # Package metadata
-├── tmp/                    # Temporary downloads
-└── .last_update_check      # Auto-update timestamp
-```
-
-**Environment Variables:**
-- `CODEMAP_HOME`: Override the default cache directory
-- `XDG_CACHE_HOME`: Respected on Linux/macOS (default: `~/.cache`)
-
-**Key Features:**
-- ✅ Complete isolation - never touches `~/go`, `~/.npm`, or system directories
-- ✅ Automatic version management - each LSP has its own versioned directory
-- ✅ Unified bin directory - all executables symlinked to one location
-- ✅ Cross-platform - works on Linux, macOS, and Windows
-- ✅ Simple priority system - system PATH → auto-download
-- ✅ **Auto-update** - checks for newer LSP versions on launch (once per 24h)
-
-**Auto-Update Behavior:**
-CodeMap automatically checks for LSP updates on launch:
-- Runs in background (non-blocking, doesn't delay startup)
-- Checks once every 24 hours (throttled)
-- Downloads newer versions if available
-- Updates take effect on next launch
-- Completely automatic and safe
-
-Example:
-```
-# First launch - checks for updates in background
-$ codemap
-[Auto-Update] Checking for LSP updates in background...
-[Auto-Update] Updating gopls from v0.21.1 to v0.21.2...
-[Auto-Update] Successfully updated gopls to v0.21.2
-
-# Second launch within 24h - skips update check
-$ codemap
-# (no update check, uses gopls v0.21.2)
-
-# Next launch after 24h+ - checks again
-$ codemap
-[Auto-Update] All packages are up to date
-```
-
-**Custom Install Location:**
 ```bash
-# Use a custom directory
-export CODEMAP_HOME=/custom/path/to/codemap
-./codemap
+# Build or rebuild the index
+codemap index
 
-# All LSPs will be installed in /custom/path/to/codemap/packages/
+# Show index statistics
+codemap status
+
+# List all symbols in a file
+codemap symbols internal/graph/store.go
+
+# Find all locations of a symbol
+codemap symbol Open --source
+
+# Show transitive dependents of a symbol
+codemap impact NodeID --json
+
+# Show LSP diagnostics
+codemap diagnostics --severity 1
 ```
 
-### Available Tools
+---
 
-#### 1. `index`
-Manually trigger a full re-index of the workspace.
+## CLI Reference
 
-```json
-{
-  "name": "index",
-  "arguments": {
-    "force": true
-  }
-}
+All subcommands accept two persistent global flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--project-dir DIR` | auto-detected git root | Project root used for git-ignore filtering and LSP workspace |
+| `--db-dir DIR` | *(see below)* | Override the database directory |
+
+**Database path resolution:**
+
+| `--db-dir` | DB file location |
+|---|---|
+| Not set | `<cwd>/.codemap` |
+| Set to `<d>` | `<d>/codemap.sqlite` |
+
+### Subcommands
+
+```
+codemap serve
+```
+Start the MCP server over stdio. This is the default when no subcommand is given.
+
+---
+
+```
+codemap watch [--daemon]
+```
+Spawn a background file-watcher daemon. The daemon re-indexes changed files incrementally and stops itself after **5 minutes of inactivity**. `--daemon` is internal (used by the spawned process).
+
+---
+
+```
+codemap index
+```
+Perform a full (re)build of the symbol index. Blocks until complete and prints `nodes=N  edges=M`.
+
+---
+
+```
+codemap status
+```
+Print node and edge counts from the existing index. Returns an error if no index has been built yet.
+
+---
+
+```
+codemap symbols <file> [--json]
+```
+List every symbol defined in `<file>`. Accepts relative or absolute paths.
+
+```
+KIND      NAME          LINES   (internal/graph/store.go)
+function  Open          88-115
+function  OpenReadOnly  118-133
+function  BulkUpsert…   136-160
 ```
 
-**Response:** `"Indexed 47 nodes and 23 edges"`
+---
 
-#### 2. `get_symbols_in_file`
-List all symbols in a specific file.
+```
+codemap symbol <name> [--source] [--json]
+```
+Find all locations of `<name>` across the project. `--source` includes the source code snippet.
 
-```json
-{
-  "name": "get_symbols_in_file",
-  "arguments": {
-    "file_path": "/absolute/path/to/main.go"
-  }
-}
+```
+KIND      FILE                        LINES   NAME
+function  internal/graph/store.go     88-115  Open
 ```
 
-**Response:**
-```json
-[
-  {"name": "ProcessOrder", "kind": "function_declaration", "range": "10:0-25:1"},
-  {"name": "ValidateOrder", "kind": "function_declaration", "range": "27:0-35:1"},
-  {"name": "Order", "kind": "class_definition", "range": "5:0-8:1"}
-]
+---
+
+```
+codemap impact <name> [--json]
+```
+Show every symbol that **transitively depends on** `<name>` (reverse-edge traversal via recursive CTE).
+
+---
+
+```
+codemap diagnostics [--file PATH] [--severity N] [--json]
+```
+List LSP diagnostics captured during the last index run.
+
+| `--severity` | Level |
+|---|---|
+| `1` | error |
+| `2` | warning |
+| `3` | info |
+| `4` | hint |
+| `0` (default) | all |
+
+```
+SEVERITY  FILE                  LINE  COL  SOURCE  MESSAGE
+error     internal/graph/st…    42    5    gopls   undefined: foo
 ```
 
-#### 3. `find_impact`
-Find all downstream dependencies of a symbol (recursive).
+---
 
-```json
-{
-  "name": "find_impact",
-  "arguments": {
-    "symbol_name": "ProcessOrder"
-  }
-}
-```
+## MCP Tools
 
-**Response:**
-```json
-[
-  {"name": "CreateInvoice", "file_path": "/path/to/billing.go", "kind": "function_declaration"},
-  {"name": "ShipOrder", "file_path": "/path/to/shipping.go", "kind": "function_declaration"},
-  {"name": "NotifyCustomer", "file_path": "/path/to/notifications.go", "kind": "function_declaration"}
-]
-```
+| Tool | Description |
+|------|-------------|
+| `index` | Trigger a full re-index; waits for completion and reports node/edge/diagnostic counts |
+| `index_status` | Return current index status (`idle`, `in_progress`, `ready`, `failed`) with counts |
+| `get_symbols_in_file` | List all symbols in a file (accepts relative or absolute paths) |
+| `get_symbol` | Find all locations of a named symbol; optional `with_source` flag |
+| `find_impact` | Transitive reverse-dependency analysis — all symbols that depend on the named symbol |
+| `get_diagnostics` | Return LSP diagnostics; optional `file_path` and `severity` filters |
 
-#### 4. `get_symbol`
-Find where a symbol is defined and optionally retrieve its source code.
+### MCP Resources
 
-```json
-{
-  "name": "get_symbol",
-  "arguments": {
-    "symbol_name": "ProcessOrder",
-    "with_source": true
-  }
-}
-```
+| URI | Description |
+|-----|-------------|
+| `codemap://usage-guidelines` | System prompt and operating guidelines (Markdown) |
+| `codemap://schemas/{tool_name}` | JSON schema for a tool's arguments |
 
-**Response:**
-```json
-[
-  {
-    "name": "ProcessOrder",
-    "kind": "function_declaration",
-    "file_path": "/path/to/orders.go",
-    "line_start": 10,
-    "line_end": 25,
-    "col_start": 0,
-    "col_end": 1,
-    "source": "func ProcessOrder(order Order) {\n\t// ...\n}"
-  }
-]
-```
+### MCP Prompts
 
-### Available Resources
+| Prompt | Arguments | Description |
+|--------|-----------|-------------|
+| `analyze-impact` | `symbol_name` | Guide the agent to assess the blast radius of a change |
+| `explore-file` | `file_path` | Guide the agent to understand a file's structure |
+| `locate-and-explain` | `symbol_name` | Find a symbol and explain its context |
+| `re-index-workspace` | — | Instruct the agent to refresh the graph |
 
-#### `codemap://usage-guidelines`
-A markdown resource containing the system prompt and operating instructions for AI agents using CodeMap. This is automatically provided to agents to improve their decision-making.
+---
 
-#### `codemap://schemas/{tool_name}`
-JSON schema resources for each available tool (e.g., `codemap://schemas/find_impact`). These provide the exact argument structure expected by each tool, useful for validation and documentation.
+## Language Support
 
-### Available Prompts
+| Language | Extensions | Tree-sitter | LSP server | Symbols extracted |
+|----------|-----------|-------------|-----------|-------------------|
+| Go | `.go` | ✅ | gopls | functions, methods, types |
+| Python | `.py` | ✅ | pylsp | functions, classes |
+| JavaScript | `.js` `.jsx` | ✅ | typescript-language-server | functions, methods, classes, arrow-function variables |
+| TypeScript | `.ts` `.tsx` | ✅ | typescript-language-server | functions, methods, classes, interfaces, type aliases |
+| Lua | `.lua` | ✅ | lua-language-server | functions, methods |
+| Zig | `.zig` | ✅ | zls | functions |
+| Templ | `.templ` | ✅ | templ lsp | components, CSS declarations, script declarations, functions |
 
-#### 1. `analyze-impact`
-Guides the agent to analyze the "blast radius" of changing a symbol.
-- **Arguments:** `symbol_name`
+Generated files (`_templ.go`, `.sql.go`, `_string.go`) are automatically skipped.
 
-#### 2. `explore-file`
-Guides the agent to understand the internal structure of a specific file.
-- **Arguments:** `file_path`
+---
 
-#### 3. `locate-and-explain`
-Guides the agent to find a symbol and explain its context in its source file.
-- **Arguments:** `symbol_name`
+## LSP Auto-Install
 
-#### 4. `re-index-workspace`
-Directs the agent to refresh the semantic graph.
+CodeMap resolves language server binaries in this order:
+
+1. **System `$PATH`** — if `gopls` (or any other LSP binary) is already installed, it is used directly
+2. **`~/.cache/codemap/`** — previously auto-downloaded binaries are cached here
+3. **Auto-download** — if not found anywhere, the binary is downloaded and saved to `~/.cache/codemap/`
+
+A **silent background upgrade check** runs once per process. If a newer version of a cached binary is available it is reinstalled without blocking the main indexing flow.
+
+To use your own LSP installations, simply ensure they are on `$PATH` — CodeMap will find and use them.
+
+---
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                     CodeMap                            │
-├────────────────────────────────────────────────────────┤
-│                                                        │
-│  ┌───────────────────────────────────────────────┐     │
-│  │              Initial Index                    │     │
-│  │  • Scan workspace with tree-sitter            │     │
-│  │  • Store nodes (symbols) in SQLite            │     │
-│  │  • LSP enrichment (cross-file references)     │     │
-│  │  • Store edges (relationships)                │     │
-│  └───────────────────────────────────────────────┘     │
-│                       ↓                                │
-│  ┌───────────────────────────────────────────────┐     │
-│  │         File Watcher (background)             │     │
-│  │  • Monitor file changes (fsnotify)            │     │
-│  │  • Debounce (500ms)                           │     │
-│  │  • Incremental re-index on save               │     │
-│  └───────────────────────────────────────────────┘     │
-│                       ↓                                │
-│  ┌───────────────────────────────────────────────┐     │
-│  │          MCP Server (foreground)              │     │
-│  │  • JSON-RPC over stdio                        │     │
-│  │  • 4 tools: index, get_symbols_in_file,       │     │
-│  │    find_impact, get_symbol                    │     │
-│  │  • 4 prompts: analyze-impact, explore-file,   │     │
-│  │    locate-and-explain, re-index-workspace     │     │
-│  │  • 1 resource: codemap://usage-guidelines     │     │
-│  └───────────────────────────────────────────────┘     │
-│                                                        │
-└────────────────────────────────────────────────────────┘
-          ↓                    ↓                    ↓
-    ┌──────────┐        ┌──────────┐        ┌──────────┐
-    │ Scanner  │        │   LSP    │        │  Store   │
-    │(tree-    │        │(gopls,   │        │(SQLite   │
-    │sitter)   │        │pyright)  │        │+ CTEs)   │
-    └──────────┘        └──────────┘        └──────────┘
+codemap
+├── MCP server (serve command / default)
+│   └── JSON-RPC over stdio
+│       ├── 6 tools
+│       ├── 4 prompts
+│       └── 2 resource endpoints
+│
+├── CLI (index / status / symbols / symbol / impact / diagnostics)
+│   └── reads the same SQLite database (read-only)
+│
+└── Engine (shared by all modes)
+    ├── Scanner — Tree-sitter AST parsing → graph.Node values
+    ├── LSP Service — references + implementations → graph.Edge values
+    │   └── per-language Client with adaptive warmup + notification handling
+    ├── Graph Store — SQLite (WAL, foreign keys, recursive CTEs)
+    │   ├── nodes (symbols)
+    │   ├── edges (references, implements)
+    │   └── diagnostics + diagnostic_edges
+    └── Watcher — fsnotify + 500 ms debounce + 5 min idle timeout
 ```
 
-### Core Components
+### Node ID
 
-#### Scanner
-- **Technology:** Tree-sitter for AST parsing
-- **Languages:** Go, Python, JavaScript, TypeScript, Lua, Zig
-- **Performance:** Parses ~100 files/second
-- **Filtering:** Respects `.gitignore`, skips common ignore dirs
-
-#### LSP Integration
-- **Purpose:** Resolve cross-file references and relationships
-- **Servers:** gopls, pyright, typescript-language-server, lua-language-server, zls
-- **Features:** Definition lookup, implementation tracking, reference finding
-- **Auto-Download:** Automatically downloads missing LSP servers to `~/.cache/codemap/lsp/`
-- **Priority:** Custom paths (flags) → System PATH → Auto-download
-
-#### Graph Store
-- **Database:** SQLite with WAL mode
-- **Schema:** 
-  - `nodes` - Code symbols (functions, classes, etc.)
-- `edges` - Relationships (implements, references)
-- **Queries:** Recursive CTEs for dependency traversal
-- **Indexing:** Optimized for file_path and symbol_name lookups
-
-#### File Watcher
-- **Technology:** fsnotify (cross-platform)
-- **Debouncing:** 500ms to avoid rapid re-indexes
-- **Incremental:** Only re-scans changed files
-- **Events:** CREATE, MODIFY, DELETE, RENAME
+Node IDs are deterministic: `SHA256(filePath + ":" + name + ":" + kind)[:16]` (32-char hex). This makes incremental updates collision-safe and idempotent.
 
 ### Data Model
 
-**Node:**
-```go
+```json
+// Node
 {
-  "id": "sha256(file_path + symbol_name)",
-  "name": "ProcessOrder",
-  "kind": "function_declaration",
-  "file_path": "/absolute/path/to/orders.go",
-  "line_start": 10,
-  "line_end": 25,
-  "col_start": 0,
+  "id": "a3f1…c9d2",
+  "name": "Open",
+  "kind": "function",
+  "file_path": "/abs/path/to/store.go",
+  "line_start": 88,
+  "line_end": 115,
+  "col_start": 1,
   "col_end": 1,
-  "symbol_uri": "file:///absolute/path/to/orders.go"
+  "name_line": 88,
+  "name_col": 6,
+  "symbol_uri": "file:///abs/path/to/store.go"
 }
-```
 
-**Edge:**
-```go
+// Edge
 {
-  "source_id": "node_id_1",
-  "target_id": "node_id_2",
-  "relation": "implements" | "references"
+  "source_id": "a3f1…c9d2",
+  "target_id": "b7e4…1a88",
+  "relation": "references"  // or "implements"
 }
-```
 
-## Performance
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| **Initial index (100 files)** | 1-2s | Tree-sitter + LSP enrichment |
-| **Re-index single file** | ~100ms | Incremental update |
-| **File change detection** | <1ms | OS-level events |
-| **Symbol lookup** | <10ms | Indexed query |
-| **Recursive dependency query** | <100ms | CTE optimization |
-| **Memory usage** | ~50MB | Base + graph data |
-
-## Requirements
-
-### System Requirements
-- **OS:** Linux, macOS, or Windows
-- **RAM:** 100MB minimum
-- **Disk:** Varies by codebase size (SQLite database)
-- **Go:** 1.25.6+ (for building)
-
-### Language Server Requirements
-
-CodeMap **automatically downloads** missing language servers on first use. No manual installation required!
-
-Downloaded binaries are stored in `~/.cache/codemap/lsp/` and don't pollute your system PATH.
-
-**Optional manual installation:**
-
-| Language | Server | Installation |
-|----------|--------|--------------|
-| Go | gopls | `go install golang.org/x/tools/gopls@latest` |
-| Python | pyright | `pip install pyright` |
-| JavaScript/TypeScript | typescript-language-server | `npm install -g typescript-language-server typescript` |
-| Lua | lua-language-server | `brew install lua-language-server` |
-| Zig | zls | `brew install zls` |
-
-**Priority order:** Custom paths (via flags) → System PATH → Auto-download
-
-### Language Feature Status
-
-| Language | AST Parsing | LSP Enrichment | LSP Server | Custom Path Flag |
-|----------|-------------|----------------|------------|------------------|
-| Go | ✅ | ✅ | gopls | `--gopls-path` |
-| Python | ✅ | ✅ | pyright-langserver | `--pyright-langserver-path` |
-| JavaScript/TypeScript | ✅ | ✅ | typescript-language-server | `--typescript-language-server-path` |
-| Lua | ✅ | ✅ | lua-language-server | `--lua-language-server-path` |
-| Zig | ✅ | ✅ | zls | `--zls-path` |
-
-**Why required?** Without LSP servers, CodeMap cannot generate edges (relationships between symbols), making the graph incomplete and the `find_impact` tool useless.
-
-### Verification
-
-Check if language servers are installed:
-
-```bash
-which gopls                      # Go
-which pyright-langserver         # Python
-which typescript-language-server # TypeScript/JavaScript
-which lua-language-server        # Lua
-which zls                        # Zig
-```
-
-## Examples
-
-### Use Case 1: Impact Analysis
-
-**Question:** "What will break if I change the `ProcessOrder` function?"
-
-```bash
-# AI agent calls find_impact
+// Diagnostic
 {
-  "tool": "find_impact",
-  "arguments": {"symbol_name": "ProcessOrder"}
+  "id": "d9c3…7f41",
+  "file_path": "/abs/path/to/store.go",
+  "line": 42,
+  "col": 5,
+  "severity": 1,
+  "code": "undeclared",
+  "source": "gopls",
+  "message": "undefined: foo"
 }
-
-# Response shows all downstream dependencies:
-# - CreateInvoice (in billing.go)
-# - ShipOrder (in shipping.go)  
-# - NotifyCustomer (in notifications.go)
 ```
 
-**Result:** AI knows exactly what to review before making changes.
+---
 
-### Use Case 2: Code Navigation
-
-**Question:** "Where is the `ValidateUser` function defined?"
-
-```bash
-{
-  "tool": "get_symbol",
-  "arguments": {"symbol_name": "ValidateUser"}
-}
-
-# Response:
-# File: /path/to/auth.go
-# Lines: 45-67
-```
-
-**Result:** AI can read the exact file and lines.
-
-### Use Case 3: File Structure Understanding
-
-**Question:** "What functions are in `main.go`?"
-
-```bash
-{
-  "tool": "get_symbols_in_file",
-  "arguments": {"file_path": "/path/to/main.go"}
-}
-
-# Response lists all symbols:
-# - main (function)
-# - setupServer (function)
-# - Config (struct)
-```
-
-**Result:** AI understands file organization.
-
-### Use Case 4: Real-time Updates
-
-**Scenario:** Developer edits `orders.go`
-
-```
-1. Developer saves file
-   ↓
-2. CodeMap detects change (via fsnotify)
-   ↓
-3. Waits 500ms (debounce)
-   ↓
-4. Re-scans orders.go (~100ms)
-   ↓
-5. Updates database
-   ↓
-6. AI's next query sees fresh data
-```
-
-**Result:** AI always works with up-to-date code graph.
-
-## Development
-
-### Building from Source
-
-Using `mise` (recommended):
-```bash
-# Clone repository
-git clone https://github.com/yourusername/codemap.git
-cd codemap
-
-# Install dependencies and tools
-mise install
-
-# Build
-mise run build
-
-# Run tests
-mise run test
-
-# Format code
-mise run fmt
-
-# Lint
-mise run vet
-```
-
-Using standard Go:
-```bash
-# Clone repository
-git clone https://github.com/yourusername/codemap.git
-cd codemap
-
-# Install dependencies
-go mod download
-
-# Build
-go build -o codemap main.go
-
-# Run tests
-go test ./...
-
-# Format code
-gofmt -w .
-
-# Lint
-go vet ./...
-```
-
-### Project Structure
+## Project Structure
 
 ```
 codemap/
-├── main.go                 # Entry point, orchestrates components
-├── SYSTEM_PROMPT.md        # System guidelines (embedded as MCP resource)
-├── go.mod                  # Go module definition
-├── go.sum                  # Dependency checksums
-├── mise.toml               # Task runner configuration
+├── main.go              # Cobra root command + serve / watch / index
+├── commands.go          # CLI subcommands: status, symbols, symbol, impact, diagnostics
+├── SYSTEM_PROMPT.md     # Embedded MCP usage guidelines
+├── go.mod / go.sum
+├── mise.toml            # Task runner (build, test, vet)
 ├── internal/
-│   ├── db/                 # SQLite initialization and schema
-│   │   └── db.go
-│   ├── graph/              # Graph data model and storage
-│   │   ├── types.go        # Node and Edge types
-│   │   └── store.go        # CRUD operations, recursive queries
-│   ├── lsp/                # LSP client implementation
-│   │   ├── lsp.go          # Client, Service, enrichment logic
-│   │   ├── transport.go    # JSON-RPC message framing
-│   │   └── types.go        # LSP protocol types
-│   ├── scanner/            # Tree-sitter AST parsing
-│   │   ├── scanner.go      # File scanning, node extraction
-│   │   └── queries.go      # Tree-sitter query definitions
-│   ├── server/             # MCP server implementation
-│   │   ├── server.go       # Core server logic
-│   │   ├── tools.go        # Tool registration
-│   │   ├── resources.go    # Resource registration
-│   │   └── prompts.go      # Prompt registration
-│   └── watcher/            # File system monitoring
-│       └── watcher.go      # fsnotify integration, debouncing
-├── util/                   # Utility functions
-│   ├── git.go              # Git root finding
-│   ├── hash.go             # Node ID generation
-│   └── uri.go              # File path ↔ URI conversion
-└── tests/                  # Integration tests
+│   ├── daemon/          # PID file management, detached process spawning
+│   ├── db/              # EnsureDir helper
+│   ├── graph/
+│   │   ├── types.go     # Node, Edge, Diagnostic, DiagnosticEdge types + constants
+│   │   └── store.go     # Open/OpenReadOnly, all CRUD, recursive CTE queries, diagnostics
+│   ├── lsp/
+│   │   ├── lsp.go       # Client (send loop, notification handling, DrainDiagnostics), Service
+│   │   ├── transport.go # LSP stdio framing (Content-Length headers)
+│   │   └── types.go     # JSON-RPC 2.0 + LSP protocol types
+│   ├── pkgmgr/
+│   │   ├── manager.go   # Manager.ResolveBinary, Install
+│   │   ├── metadata.go  # Per-binary install/version/latest recipes, archive extraction
+│   │   └── upgrade.go   # Background silent upgrade checks
+│   ├── scanner/
+│   │   ├── scanner.go   # New(root), Scan, ScanFile — Tree-sitter walk
+│   │   └── queries.go   # Tree-sitter S-expression queries per language
+│   ├── server/
+│   │   ├── server.go    # New/NewWatch, ForceIndex, WaitForIndex, runIndex, saveDiagnostics
+│   │   ├── tools.go     # MCP tool registration (6 tools)
+│   │   ├── resources.go # MCP resource registration
+│   │   ├── prompts.go   # MCP prompt registration
+│   │   └── query.go     # NodeWithSource, NodeToWithSource, AbsFilePath (shared by MCP + CLI)
+│   ├── treesittertempl/ # CGo wrapper for the Templ tree-sitter grammar (parser.c + scanner.c)
+│   └── watcher/
+│       └── watcher.go   # New, Run(ctx, cancel), idle timeout, debounce, reindexFile
+├── util/
+│   ├── git.go           # FindGitRoot(dir)
+│   ├── hash.go          # NodeID, DiagnosticID
+│   └── uri.go           # PathToURI, URIToPath
+└── tests/
     ├── integration_test.go
     └── lsp_integration_test.go
 ```
 
-### Adding a New Language
+---
 
-1. **Add tree-sitter grammar:**
-```go
-// internal/scanner/scanner.go
-import tsrust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
-
-s.languages["rs"] = sitter.NewLanguage(tsrust.Language())
-```
-
-2. **Add query:**
-```go
-// internal/scanner/queries.go
-const RustQuery = `
-  (function_item name: (identifier) @function_declaration)
-  (struct_item name: (type_identifier) @class_definition)
-`
-Queries["rust"] = RustQuery
-```
-
-3. **Add LSP support:**
-```go
-// internal/lsp/lsp.go
-case "rust":
-    return "rust-analyzer", []string{}
-```
-
-4. **Add installation instructions:**
-```go
-case "rust":
-    return "curl -L https://github.com/rust-analyzer/rust-analyzer/releases/latest/download/rust-analyzer-x86_64-unknown-linux-gnu.gz | gunzip -c - > ~/.local/bin/rust-analyzer"
-```
-
-### Running Tests
+## Building and Testing
 
 ```bash
-# All tests
+# Build
+go build -o codemap .
+# or
+mise run build
+
+# Test
+go test ./...
+# or
 mise run test
 
-# Specific package
-go test ./internal/lsp -v
-
-# Integration tests only
-go test ./tests -v
-
-# Race detector (slower but thorough)
-go test -race ./...
+# Vet
+go vet ./...
+# or
+mise run vet
 ```
+
+---
 
 ## Troubleshooting
 
-### "Language server(s) not found"
+**`project has not been indexed yet — run: codemap index`**
+Run `codemap index` once before using `status`, `symbols`, `symbol`, `impact`, or `diagnostics`.
 
-**Problem:** CodeMap can't find required language servers.
+**LSP enrichment produces no edges**
+The language server needs a few seconds to index the workspace. The first run includes a 5-second warmup wait per language. Subsequent runs use the cached binary with no delay.
 
-**Solution:** Install missing servers:
-```bash
-# Check which are missing
-which gopls pyright-langserver typescript-language-server lua-language-server zls
-
-# Install missing ones (see Requirements section)
-```
-
-### "Failed to init DB"
-
-**Problem:** Cannot create database file.
-
-**Solution:** 
-- Check write permissions in current directory
-- Ensure `.ctxhub/` directory is writable
-- Try running from a different directory
-
-### "Watch limit exceeded" (Linux)
-
-**Problem:** Too many directories to watch.
-
-**Solution:** Increase inotify limit:
+**`inotify: too many open files` (Linux)**
 ```bash
 echo fs.inotify.max_user_watches=524288 | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
 ```
 
-### High Memory Usage
+**High memory / slow index on large codebases**
+Tree-sitter scanning is fast; the bottleneck is LSP enrichment. Run `codemap index` once, then use the watcher daemon (`codemap watch`) for incremental updates.
 
-**Problem:** Large codebase causing high memory usage.
-
-**Solution:**
-- Check database size: `du -h .ctxhub/codemap.sqlite`
-- Clean old data: `rm -rf .ctxhub/` and re-run
-- For very large codebases (>10k files), consider indexing subdirectories separately
-
-### LSP Enrichment Slow
-
-**Problem:** Initial indexing takes >5 seconds.
-
-**Solution:**
-- This is normal for language servers indexing the workspace
-- Subsequent updates are fast (~100ms)
-- Ensure language servers are up-to-date
-
-## FAQ
-
-**Q: Does CodeMap work with monorepos?**  
-A: Yes, but consider the size. Very large monorepos (>50k files) may hit system watch limits.
-
-**Q: Can I use CodeMap in CI/CD?**  
-A: Yes, but file watching is always on. For CI/CD, you may want a `--index-only` flag (not yet implemented).
-
-**Q: Does it support remote filesystems?**  
-A: File watching may not work on network drives. Use locally for best results.
-
-**Q: How much disk space does the database use?**  
-A: Roughly 1MB per 1000 nodes. A typical project with 10k symbols = ~10MB database.
-
-**Q: Can multiple CodeMap instances run in the same directory?**  
-A: No, SQLite database locking prevents this. Use one instance per workspace.
-
-**Q: Does it preserve the graph between runs?**  
-A: Yes! The SQLite database persists in `.ctxhub/codemap.sqlite`.
-
-**Q: How do I reset the graph?**  
-A: Delete the database: `rm -rf .ctxhub/` and restart CodeMap.
-
-## Troubleshooting
-
-### LSP Server Issues
-
-**Problem:** LSP server download fails
-
-```
-Failed to download gopls: download failed after 3 attempts
-```
-
-**Solutions:**
-1. Check network connectivity
-2. Verify disk space: `df -h ~/.cache/codemap/lsp/`
-3. Set custom cache directory: `export CODEMAP_CACHE_DIR=/custom/path`
-4. Install manually and use system PATH
-
-**Problem:** Permission denied on cache directory
-
-```
-Failed to create version dir: permission denied
-```
-
-**Solutions:**
-1. Fix permissions: `chmod -R 755 ~/.cache/codemap/`
-2. Set alternative cache: `export CODEMAP_CACHE_DIR=$HOME/codemap-cache`
-3. Use custom LSP paths: `--gopls-path /your/gopls`
-
-### Cache Management
-
-**View downloaded LSP servers:**
-```bash
-ls -lh ~/.cache/codemap/lsp/
-```
-
-**Clear cache to force re-download:**
-```bash
-rm -rf ~/.cache/codemap/lsp/
-```
-
-**Check which LSP is being used:**
-```bash
-# Look for log messages like:
-# [go] Using system LSP: /usr/local/bin/gopls
-# [python] Using cached LSP: ~/.cache/codemap/lsp/python/1.1.390/pyright-langserver
-# [typescript] LSP not found, downloading...
-```
-
-### Environment Variables
-
-- `CODEMAP_CACHE_DIR` - Override cache directory location
-- `XDG_CACHE_HOME` - Standard cache directory (Unix-like systems)
-
-## Limitations
-
-- **Language support:** Only Go, Python, JS, TS, Lua, Zig (more languages can be added)
-- **Single workspace:** Designed for one codebase at a time
-- **Local only:** Not designed for remote/distributed use
-- **LSP required:** Cannot generate edges without language servers
-- **System limits:** File watching subject to OS limits (inotify on Linux)
-
-## Comparison
-
-| Feature | CodeMap | Language Server | IDE Plugin |
-|---------|------------|-----------------|------------|
-| **Cross-language** | ✅ 5 languages | ❌ Single | ⚠️ Varies |
-| **Persistent graph** | ✅ SQLite | ❌ In-memory | ⚠️ Varies |
-| **MCP protocol** | ✅ Native | ❌ | ❌ |
-| **Auto re-index** | ✅ File watching | ❌ | ✅ IDE-specific |
-| **Dependency analysis** | ✅ Recursive CTEs | ⚠️ Limited | ⚠️ Limited |
-| **Zero config** | ✅ Just run | ❌ Complex setup | ✅ Built-in |
-| **AI integration** | ✅ MCP tools | ⚠️ LSP adapter needed | ❌ |
-
-## Contributing
-
-Contributions welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Development Guidelines
-
-- Follow standard Go idioms
-- Add tests for new features
-- Update documentation
-- Run `gofmt` before committing
-- Ensure `go vet` passes
+---
 
 ## License
 
-GNU General Public License v3.0 - see [LICENSE](LICENSE) file for details.
-
-## Credits
-
-Built with:
-- [Tree-sitter](https://tree-sitter.github.io/) - AST parsing
-- [Model Context Protocol](https://modelcontextprotocol.io) - AI agent integration
-- [fsnotify](https://github.com/fsnotify/fsnotify) - File watching
-- [SQLite](https://www.sqlite.org/) - Graph storage
+GNU General Public License v3.0 — see [LICENSE](LICENSE).
