@@ -14,7 +14,7 @@ func TestIntegration_ReindexAndQuery(t *testing.T) {
 	// 1. Setup Temp DB within a temp dir (graph.Open creates .ctxhub/ inside it).
 	wsDir := t.TempDir()
 
-	store, err := graph.Open(wsDir)
+	store, err := graph.Open(filepath.Join(wsDir, "test.db"))
 	if err != nil {
 		t.Fatalf("Failed to open store: %v", err)
 	}

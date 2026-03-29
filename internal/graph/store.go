@@ -14,9 +14,9 @@ import (
 	dbutil "codemap/internal/db"
 )
 
-// ErrNotIndexed is returned by OpenReadOnly when no index database exists yet.
-// Callers should instruct the user to run `codemap index` (or the MCP index tool).
-var ErrNotIndexed = errors.New("project has not been indexed yet — run the index tool first")
+// ErrNotIndexed is returned by OpenReadOnly when no index database exists yet
+// for the project. Callers should instruct the user to run `codemap index`.
+var ErrNotIndexed = errors.New("project has not been indexed yet — run: codemap index")
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -86,12 +86,11 @@ type Store struct {
 	db *sql.DB
 }
 
-// Open opens (or creates) the codemap SQLite database for the given project
-// directory, applies the schema, and returns the store.
-func Open(projectPath string) (*Store, error) {
-	dbPath, err := dbutil.DBPath(projectPath, "codemap.sqlite")
-	if err != nil {
-		return nil, fmt.Errorf("graph: resolve db path: %w", err)
+// Open opens (or creates) the codemap SQLite database at dbPath,
+// applies the schema, and returns the store.
+func Open(dbPath string) (*Store, error) {
+	if err := dbutil.EnsureDir(dbPath); err != nil {
+		return nil, fmt.Errorf("graph: ensure db dir: %w", err)
 	}
 
 	db, err := sql.Open("sqlite3", dbPath+"?cache=shared&mode=rwc&_foreign_keys=on&_journal_mode=WAL")
@@ -107,14 +106,9 @@ func Open(projectPath string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// OpenReadOnly opens an existing codemap database in read-only mode.
-// If the database file does not exist it returns ErrNotIndexed.
-func OpenReadOnly(projectPath string) (*Store, error) {
-	dbPath, err := dbutil.DBPath(projectPath, "codemap.sqlite")
-	if err != nil {
-		return nil, fmt.Errorf("graph: resolve db path: %w", err)
-	}
-
+// OpenReadOnly opens an existing codemap database at dbPath in read-only mode.
+// If the file does not exist it returns ErrNotIndexed.
+func OpenReadOnly(dbPath string) (*Store, error) {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, ErrNotIndexed
 	}

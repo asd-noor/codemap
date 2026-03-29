@@ -69,6 +69,16 @@ func ReadLines(path string, lineStart, lineEnd int) string {
 	return out.String()
 }
 
+// absPath resolves p to an absolute path using AbsFilePath.
+// Returns p unchanged on error.
+func absPath(p string) string {
+	abs, err := AbsFilePath(p)
+	if err != nil {
+		return p
+	}
+	return abs
+}
+
 // ── Helper result builders ────────────────────────────────────────────────────
 
 func textResult(text string) *mcp.CallToolResult {
@@ -154,7 +164,7 @@ func (s *Server) registerTools() {
 		if err := s.WaitForIndex(ctx); err != nil {
 			return errorResult(fmt.Sprintf("index not ready: %v", err)), nil, nil
 		}
-		nodes, err := s.store.GetSymbolsInFile(ctx, args.FilePath)
+		nodes, err := s.store.GetSymbolsInFile(ctx, absPath(args.FilePath))
 		if err != nil {
 			return errorResult(fmt.Sprintf("query failed: %v", err)), nil, nil
 		}
@@ -198,17 +208,10 @@ func (s *Server) registerTools() {
 			return textResult(fmt.Sprintf("Symbol %q not found", args.SymbolName)), nil, nil
 		}
 
-		type nodeWithSource struct {
-			graph.Node
-			Source string `json:"source,omitempty"`
-		}
+		type nodeWithSource = NodeWithSource
 		results := make([]nodeWithSource, len(nodes))
 		for i, n := range nodes {
-			nws := nodeWithSource{Node: n}
-			if args.WithSource {
-				nws.Source = ReadLines(n.FilePath, n.LineStart, n.LineEnd)
-			}
-			results[i] = nws
+			results[i] = NodeToWithSource(n, args.WithSource)
 		}
 		return jsonResult(results), nil, nil
 	})
@@ -227,7 +230,7 @@ func (s *Server) registerTools() {
 			err   error
 		)
 		if args.FilePath != "" {
-			diags, err = s.store.GetDiagnosticsForFile(ctx, args.FilePath)
+			diags, err = s.store.GetDiagnosticsForFile(ctx, absPath(args.FilePath))
 		} else {
 			diags, err = s.store.GetAllDiagnostics(ctx)
 		}

@@ -36,7 +36,7 @@ func Helper() {
 `)
 
 	// 2. Open store.
-	store, err := graph.Open(wsDir)
+	store, err := graph.Open(filepath.Join(wsDir, "test.db"))
 	if err != nil {
 		t.Fatalf("Failed to open store: %v", err)
 	}

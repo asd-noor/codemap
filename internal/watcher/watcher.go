@@ -36,6 +36,9 @@ var skipDirs = map[string]struct{}{
 	"zig-out":      {},
 }
 
+// Handler is the callback type for per-file re-index events.
+type Handler func(ctx context.Context, path string, removed bool)
+
 // Watcher watches a project directory tree and fires re-indexing on file changes
 // after debouncing.
 type Watcher struct {

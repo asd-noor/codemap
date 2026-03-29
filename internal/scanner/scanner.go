@@ -12,6 +12,7 @@ import (
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 
+	tree_sitter_templ "codemap/internal/treesittertempl"
 	tree_sitter_lua "github.com/tree-sitter-grammars/tree-sitter-lua/bindings/go"
 	tree_sitter_zig "github.com/tree-sitter-grammars/tree-sitter-zig/bindings/go"
 	tree_sitter_go "github.com/tree-sitter/tree-sitter-go/bindings/go"
@@ -33,14 +34,15 @@ type langDef struct {
 
 // extToLang maps file extensions to language definitions.
 var extToLang = map[string]langDef{
-	".go":  {lang: sitter.NewLanguage(tree_sitter_go.Language()), query: queries["go"]},
-	".py":  {lang: sitter.NewLanguage(tree_sitter_python.Language()), query: queries["python"]},
-	".js":  {lang: sitter.NewLanguage(tree_sitter_javascript.Language()), query: queries["javascript"]},
-	".jsx": {lang: sitter.NewLanguage(tree_sitter_javascript.Language()), query: queries["javascript"]},
-	".ts":  {lang: sitter.NewLanguage(tree_sitter_typescript.LanguageTypescript()), query: queries["typescript"]},
-	".tsx": {lang: sitter.NewLanguage(tree_sitter_typescript.LanguageTSX()), query: queries["typescript"]},
-	".lua": {lang: sitter.NewLanguage(tree_sitter_lua.Language()), query: queries["lua"]},
-	".zig": {lang: sitter.NewLanguage(tree_sitter_zig.Language()), query: queries["zig"]},
+	".go":    {lang: sitter.NewLanguage(tree_sitter_go.Language()), query: queries["go"]},
+	".py":    {lang: sitter.NewLanguage(tree_sitter_python.Language()), query: queries["python"]},
+	".js":    {lang: sitter.NewLanguage(tree_sitter_javascript.Language()), query: queries["javascript"]},
+	".jsx":   {lang: sitter.NewLanguage(tree_sitter_javascript.Language()), query: queries["javascript"]},
+	".ts":    {lang: sitter.NewLanguage(tree_sitter_typescript.LanguageTypescript()), query: queries["typescript"]},
+	".tsx":   {lang: sitter.NewLanguage(tree_sitter_typescript.LanguageTSX()), query: queries["typescript"]},
+	".lua":   {lang: sitter.NewLanguage(tree_sitter_lua.Language()), query: queries["lua"]},
+	".zig":   {lang: sitter.NewLanguage(tree_sitter_zig.Language()), query: queries["zig"]},
+	".templ": {lang: sitter.NewLanguage(tree_sitter_templ.Language()), query: queries["templ"]},
 }
 
 // generatedSuffixes lists file-name suffixes that indicate machine-generated code.

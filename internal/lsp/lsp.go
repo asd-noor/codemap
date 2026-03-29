@@ -2,7 +2,7 @@
 // the symbol graph with cross-file reference and implementation edges.
 //
 // Each language server gets one persistent Client subprocess. Enrichment runs
-// in a pool of workerCount goroutines.
+// in a pool of 10 goroutines.
 package lsp
 
 import (
@@ -441,8 +441,8 @@ func (s *Service) Enrich(ctx context.Context, nodes []graph.Node, store *graph.S
 }
 
 // DrainDiagnostics collects and clears all publishDiagnostics notifications
-// that were captured across every active LSP client during the last Enrich call.
-// The returned map key is the document URI as sent by the language server.
+// that were captured across every active LSP client during the last Enrich
+// call. The returned map key is the document URI as sent by the language server.
 func (s *Service) DrainDiagnostics() map[string][]Diagnostic {
 	s.mu.Lock()
 	defer s.mu.Unlock()

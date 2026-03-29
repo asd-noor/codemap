@@ -51,7 +51,7 @@ var binaryMeta = map[string]meta{
 		latest:    latestNpmPackage("typescript-language-server"),
 	},
 	"lua-language-server": {
-		install:   luaLSInstall(),
+		install:   manualInstall("lua-language-server", "https://github.com/LuaLS/lua-language-server/releases"),
 		installed: versionFromArgs("--version"),
 		latest:    latestGitHubRelease("LuaLS", "lua-language-server"),
 	},
@@ -65,15 +65,6 @@ var binaryMeta = map[string]meta{
 		installed: versionFromArgs("version"),
 		latest:    latestGoModule("github.com/a-h/templ/cmd/templ"),
 	},
-}
-
-// Install installs a binary by name and returns the path to the installed binary.
-func Install(ctx context.Context, name string) (string, error) {
-	m, ok := binaryMeta[name]
-	if !ok {
-		return "", fmt.Errorf("pkgmgr: no install recipe for %q", name)
-	}
-	return m.install(ctx, name)
 }
 
 // goInstall returns an installFn that runs `go install <pkg>`.
@@ -123,17 +114,18 @@ func npmInstall(pkgs ...string) installFn {
 	}
 }
 
-// luaLSInstall returns an installFn that downloads lua-language-server from GitHub releases.
-func luaLSInstall() installFn {
-	const releaseURL = "https://github.com/LuaLS/lua-language-server/releases"
-	return func(ctx context.Context, name string) (string, error) {
+// manualInstall attempts a direct download for single-binary releases.
+// Falls back to an instructional error if the platform is not handled.
+func manualInstall(name, releaseURL string) installFn {
+	return func(ctx context.Context, _ string) (string, error) {
+		// Fetch the latest version dynamically so installs always get the newest release.
 		var version string
 		if lf := latestGitHubRelease("LuaLS", "lua-language-server"); lf != nil {
 			if v, err := lf(ctx); err == nil {
 				version = v
 			}
 		}
-		url := luaLSDownloadURL(version)
+		url := releaseDownloadURL(name, version)
 		if url == "" {
 			return "", fmt.Errorf(
 				"pkgmgr: cannot auto-install %s on %s/%s — please install manually: %s",
@@ -164,8 +156,12 @@ func zlsInstall() installFn {
 	}
 }
 
-// luaLSDownloadURL returns a direct download URL for lua-language-server releases.
-func luaLSDownloadURL(version string) string {
+// releaseDownloadURL returns a direct download URL for known binary releases.
+// version may be empty, in which case the bundled fallback version is used.
+func releaseDownloadURL(name, version string) string {
+	if name != "lua-language-server" {
+		return ""
+	}
 	const fallback = "3.7.4"
 	if version == "" {
 		version = fallback
@@ -227,7 +223,7 @@ func downloadBinary(ctx context.Context, name, url string) (string, error) {
 		return "", fmt.Errorf("pkgmgr: download %s: HTTP %d", url, resp.StatusCode)
 	}
 
-	// Write the archive to a temp file.
+	// Write the archive to a temp file so we can seek / re-open it for zip.
 	archiveTmp, err := os.CreateTemp("", "codemap-"+name+"-archive-*")
 	if err != nil {
 		return "", err
@@ -288,7 +284,8 @@ func extractTarGz(archivePath, binaryName, destPath string) error {
 		if hdr.Typeflag != tar.TypeReg {
 			continue
 		}
-		if filepath.Base(hdr.Name) != binaryName {
+		base := filepath.Base(hdr.Name)
+		if base != binaryName {
 			continue
 		}
 		return writeExecutable(tr, destPath)

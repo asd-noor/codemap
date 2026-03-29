@@ -1,5 +1,5 @@
-// Package db provides shared utilities for resolving per-project SQLite
-// database paths under <project-root>/.ctxhub/.
+// Package db provides a small utility for ensuring a file's parent directory
+// exists before the file is created.
 package db
 
 import (
@@ -7,17 +7,8 @@ import (
 	"path/filepath"
 )
 
-// DBPath returns the full path for a named SQLite database file inside the
-// .ctxhub directory for projectPath.
-func DBPath(projectPath, dbName string) (string, error) {
-	dir := filepath.Join(projectPath, ".ctxhub")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, dbName), nil
-}
-
-// PIDPath returns the path to the codemap daemon PID file for projectPath.
-func PIDPath(projectPath string) (string, error) {
-	return DBPath(projectPath, "codemap.pid")
+// EnsureDir creates the parent directory of filePath (including all parents)
+// if it does not already exist.
+func EnsureDir(filePath string) error {
+	return os.MkdirAll(filepath.Dir(filePath), 0o755)
 }

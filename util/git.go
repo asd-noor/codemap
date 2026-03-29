@@ -6,7 +6,7 @@ import (
 )
 
 // FindGitRoot walks up from dir until it finds a .git directory or hits the
-// filesystem root. Returns the absolute form of dir itself if no .git is found.
+// filesystem root. Returns dir itself if no .git is found.
 func FindGitRoot(dir string) string {
 	abs, err := filepath.Abs(dir)
 	if err != nil {

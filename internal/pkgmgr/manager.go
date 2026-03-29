@@ -3,7 +3,7 @@
 //
 // Resolution priority (per binary):
 //  1. Binary found on system $PATH
-//  2. Cached binary in the codemap install dir (~/.codemap/bin/)
+//  2. Cached binary in the codemap install dir
 //  3. Auto-download via the package manager
 //
 // When a binary is found via (1) or (2), a silent background upgrade check is
@@ -20,13 +20,13 @@ import (
 )
 
 // installBase returns the base directory for codemap-managed binaries:
-// $HOME/.codemap/bin/
+// $HOME/.cache/codemap/
 func installBase() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".codemap", "bin")
+	dir := filepath.Join(home, ".cache", "codemap")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -78,7 +78,17 @@ func (m *Manager) ResolveBinary(ctx context.Context, name string) (string, error
 	// 3. Auto-download.
 	installed, err := Install(ctx, name)
 	if err != nil {
-		return "", fmt.Errorf("pkgmgr: %s not found and auto-install failed: %w", name, err)
+		return "", fmt.Errorf("pkgmgr: %s not found on PATH and auto-install failed: %w", name, err)
 	}
 	return installed, nil
+}
+
+// Install downloads and installs the named language-server binary.
+// Returns the path to the installed binary.
+func Install(ctx context.Context, name string) (string, error) {
+	meta, ok := binaryMeta[name]
+	if !ok {
+		return "", fmt.Errorf("pkgmgr: no install metadata for %q", name)
+	}
+	return meta.install(ctx, name)
 }

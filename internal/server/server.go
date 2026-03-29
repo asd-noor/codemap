@@ -111,23 +111,23 @@ type Server struct {
 // New creates and starts a Server for the given project root. The initial
 // index begins immediately in a background goroutine. The file watcher runs
 // until ctx is cancelled.
-func New(ctx context.Context, rootDir string, systemPrompt string) (*Server, error) {
-	return newServer(ctx, rootDir, systemPrompt, func() {})
+func New(ctx context.Context, rootDir, dbPath, systemPrompt string) (*Server, error) {
+	return newServer(ctx, rootDir, dbPath, systemPrompt, func() {})
 }
 
 // NewWatch is like New but passes cancel to the watcher so that the watcher's
 // idle-timeout fires cancel(), unblocking the caller's <-ctx.Done().
-func NewWatch(ctx context.Context, cancel context.CancelFunc, rootDir string, systemPrompt string) (*Server, error) {
-	return newServer(ctx, rootDir, systemPrompt, cancel)
+func NewWatch(ctx context.Context, cancel context.CancelFunc, rootDir, dbPath, systemPrompt string) (*Server, error) {
+	return newServer(ctx, rootDir, dbPath, systemPrompt, cancel)
 }
 
 // newServer is the shared constructor used by New and NewWatch.
-func newServer(ctx context.Context, rootDir string, systemPrompt string, cancel context.CancelFunc) (*Server, error) {
+func newServer(ctx context.Context, rootDir, dbPath, systemPrompt string, cancel context.CancelFunc) (*Server, error) {
 	absRoot := util.FindGitRoot(rootDir)
 
-	store, err := graph.Open(absRoot)
+	store, err := graph.Open(dbPath)
 	if err != nil {
-		return nil, fmt.Errorf("server: open store: %w", err)
+		return nil, fmt.Errorf("server: open store at %s: %w", dbPath, err)
 	}
 
 	pm := pkgmgr.New()
@@ -292,3 +292,9 @@ func (srv *Server) Store() *graph.Store { return srv.store }
 
 // MCPServer returns the underlying MCP server for transport binding.
 func (srv *Server) MCPServer() *mcp.Server { return srv.mcpSrv }
+
+// OpenStoreReadOnly opens the codemap database at dbPath in read-only mode.
+// Convenience wrapper used by CLI sub-commands that only query the index.
+func OpenStoreReadOnly(dbPath string) (*graph.Store, error) {
+	return graph.OpenReadOnly(dbPath)
+}

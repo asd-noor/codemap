@@ -118,7 +118,7 @@ func Helper() {}
 	}
 
 	// Open an in-memory store for the test.
-	store, err := graph.Open(tmpDir)
+	store, err := graph.Open(filepath.Join(tmpDir, "test.db"))
 	if err != nil {
 		t.Fatalf("Failed to open store: %v", err)
 	}
