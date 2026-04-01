@@ -93,13 +93,14 @@ All subcommands accept two persistent global flags:
 |------|---------|-------------|
 | `--project-dir DIR` | auto-detected git root | Project root used for git-ignore filtering and LSP workspace |
 | `--db-dir DIR` | *(see below)* | Override the database directory |
+| `--db-name NAME` | `codemap` | File name stem used when `--db-dir` is set |
 
 **Database path resolution:**
 
 | `--db-dir` | DB file location |
 |---|---|
 | Not set | `<project-dir>/.codemap` |
-| Set to `<d>` | `<d>/codemap.sqlite` |
+| Set to `<d>` | `<d>/<db-name>.sqlite` |
 
 ### Subcommands
 

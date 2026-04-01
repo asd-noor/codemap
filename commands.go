@@ -17,13 +17,13 @@ import (
 
 // ── status ────────────────────────────────────────────────────────────────────
 
-func newStatusCmd(projectDir, dbDir *string) *cobra.Command {
+func newStatusCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Show the current codemap index status",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runStatus(dbPath)
 		},
 	}
@@ -51,14 +51,14 @@ func runStatus(dbPath string) error {
 
 // ── symbols ───────────────────────────────────────────────────────────────────
 
-func newSymbolsCmd(projectDir, dbDir *string) *cobra.Command {
+func newSymbolsCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "symbols <file>",
 		Short: "List all symbols in <file>",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runSymbols(*projectDir, dbPath, args[0], jsonOut)
 		},
 	}
@@ -99,14 +99,14 @@ func runSymbols(projectDir, dbPath, filePath string, jsonOut bool) error {
 
 // ── symbol ────────────────────────────────────────────────────────────────────
 
-func newSymbolCmd(projectDir, dbDir *string) *cobra.Command {
+func newSymbolCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	var withSource, jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "symbol <name>",
 		Short: "Find all locations of <name> in the project",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runSymbol(*projectDir, dbPath, args[0], withSource, jsonOut)
 		},
 	}
@@ -164,14 +164,14 @@ func runSymbol(projectDir, dbPath, name string, withSource, jsonOut bool) error 
 
 // ── impact ────────────────────────────────────────────────────────────────────
 
-func newImpactCmd(projectDir, dbDir *string) *cobra.Command {
+func newImpactCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "impact <name>",
 		Short: "Show all symbols that transitively depend on <name>",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runImpact(*projectDir, dbPath, args[0], jsonOut)
 		},
 	}
@@ -207,7 +207,7 @@ func runImpact(projectDir, dbPath, name string, jsonOut bool) error {
 
 // ── diagnostics ───────────────────────────────────────────────────────────────
 
-func newDiagnosticsCmd(projectDir, dbDir *string) *cobra.Command {
+func newDiagnosticsCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	var (
 		filterFile string
 		jsonOut    bool
@@ -223,7 +223,7 @@ info → hint) then by line number. Use --severity to restrict output to a
 specific level (1=error, 2=warning, 3=info, 4=hint).`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runDiagnostics(*projectDir, dbPath, filterFile, severity, jsonOut)
 		},
 	}

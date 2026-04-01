@@ -7,12 +7,15 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"codemap/internal/daemon"
 	"codemap/internal/server"
+	"codemap/internal/ui"
 	"codemap/util"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,6 +28,7 @@ func main() {
 	var (
 		projectDir string
 		dbDir      string
+		dbName     string
 	)
 
 	root := &cobra.Command{
@@ -34,35 +38,36 @@ func main() {
 graph in SQLite, and exposes it both as an MCP server (for AI agents) and as a
 human-friendly CLI.
 
-All sub-commands share --project-dir and --db-dir:
+		All sub-commands share --project-dir, --db-dir, and --db-name:
 
-  codemap [--project-dir DIR] [--db-dir DIR] serve
-  codemap [--project-dir DIR] [--db-dir DIR] watch
-  codemap [--project-dir DIR] [--db-dir DIR] index
-  codemap [--project-dir DIR] [--db-dir DIR] status
-  codemap [--project-dir DIR] [--db-dir DIR] symbols <file>
-  codemap [--project-dir DIR] [--db-dir DIR] symbol  <name>
-  codemap [--project-dir DIR] [--db-dir DIR] impact  <name>
-  codemap [--project-dir DIR] [--db-dir DIR] diagnostics`,
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] serve
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] watch
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] index
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] status
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] symbols <file>
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] symbol  <name>
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] impact  <name>
+		  codemap [--project-dir DIR] [--db-dir DIR] [--db-name NAME] diagnostics`,
 		// Default action when no sub-command is given: run as MCP server.
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(projectDir, dbDir)
+			dbPath, _ := resolveStorePaths(projectDir, dbDir, dbName)
 			return runServe(projectDir, dbPath)
 		},
 	}
 
 	root.PersistentFlags().StringVar(&projectDir, "project-dir", "", "Project directory (default: auto-detected git root from CWD)")
 	root.PersistentFlags().StringVar(&dbDir, "db-dir", "", "Database directory override. If set, DB is at <db-dir>/codemap.sqlite; default is <project-dir>/.codemap")
+	root.PersistentFlags().StringVar(&dbName, "db-name", "codemap", "Database file name stem used with --db-dir")
 
 	root.AddCommand(
-		newServeCmd(&projectDir, &dbDir),
-		newWatchCmd(&projectDir, &dbDir),
-		newIndexCmd(&projectDir, &dbDir),
-		newStatusCmd(&projectDir, &dbDir),
-		newSymbolsCmd(&projectDir, &dbDir),
-		newSymbolCmd(&projectDir, &dbDir),
-		newImpactCmd(&projectDir, &dbDir),
-		newDiagnosticsCmd(&projectDir, &dbDir),
+		newServeCmd(&projectDir, &dbDir, &dbName),
+		newWatchCmd(&projectDir, &dbDir, &dbName),
+		newIndexCmd(&projectDir, &dbDir, &dbName),
+		newStatusCmd(&projectDir, &dbDir, &dbName),
+		newSymbolsCmd(&projectDir, &dbDir, &dbName),
+		newSymbolCmd(&projectDir, &dbDir, &dbName),
+		newImpactCmd(&projectDir, &dbDir, &dbName),
+		newDiagnosticsCmd(&projectDir, &dbDir, &dbName),
 	)
 
 	if err := root.Execute(); err != nil {
@@ -72,9 +77,9 @@ All sub-commands share --project-dir and --db-dir:
 
 // resolveStorePaths computes the SQLite file path and PID file path from flags.
 //
-//	--db-dir not set  →  dbPath = <project-dir>/.codemap pidPath = <project-dir>/.codemap.pid
-//	--db-dir=<d>      →  dbPath = <d>/codemap.sqlite    pidPath = <d>/codemap.pid
-func resolveStorePaths(projectDir, dbDirFlag string) (dbPath, pidPath string) {
+//	--db-dir not set  →  dbPath = <project-dir>/.codemap        pidPath = <project-dir>/.codemap.pid
+//	--db-dir=<d>      →  dbPath = <d>/<db-name>.sqlite          pidPath = <d>/<db-name>.pid
+func resolveStorePaths(projectDir, dbDirFlag, dbName string) (dbPath, pidPath string) {
 	if dbDirFlag == "" {
 		base := resolveProjectDir(projectDir)
 		return filepath.Join(base, ".codemap"),
@@ -85,8 +90,11 @@ func resolveStorePaths(projectDir, dbDirFlag string) (dbPath, pidPath string) {
 		fmt.Fprintf(os.Stderr, "codemap: failed to resolve --db-dir: %v\n", err)
 		os.Exit(1)
 	}
-	return filepath.Join(abs, "codemap.sqlite"),
-		filepath.Join(abs, "codemap.pid")
+	if dbName == "" {
+		dbName = "codemap"
+	}
+	return filepath.Join(abs, dbName+".sqlite"),
+		filepath.Join(abs, dbName+".pid")
 }
 
 // resolveProjectDir returns the absolute project root directory.
@@ -111,13 +119,13 @@ func rootDir(projectDir string) string {
 
 // ── serve ──────────────────────────────────────────────────────────────────────────
 
-func newServeCmd(projectDir, dbDir *string) *cobra.Command {
+func newServeCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
 		Short: "Run as an MCP server over stdio (default when no sub-command is given)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runServe(*projectDir, dbPath)
 		},
 	}
@@ -130,11 +138,41 @@ func runServe(projectDir, dbPath string) error {
 	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := server.New(sigCtx, rootDir(projectDir), dbPath, systemPrompt)
+	ui.Banner()
+	ui.StatusStarting(rootDir(projectDir), dbPath)
+
+	// Setup visualization callback with spinner
+	spinner := ui.NewSpinner()
+	var (
+		mu      sync.Mutex
+		lastIdx int
+	)
+
+	callback := func(nodes, edges int, elapsed time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if edges == 0 && nodes > lastIdx {
+			// During scanning phase
+			lastIdx = nodes
+			ui.StatusIndexing(spinner.Frame())
+		} else if edges > 0 {
+			// After enrichment phase
+			if edges > lastIdx {
+				ui.StatusIndexed(nodes, edges)
+				lastIdx = edges
+			}
+		}
+	}
+
+	srv, err := server.NewWithCallback(sigCtx, rootDir(projectDir), dbPath, systemPrompt, callback)
 	if err != nil {
+		ui.StatusFailed(err)
 		return fmt.Errorf("serve: %w", err)
 	}
 	defer srv.Close()
+
+	ui.StatusReady()
 
 	if err := srv.MCPServer().Run(sigCtx, &mcp.StdioTransport{}); err != nil && sigCtx.Err() == nil {
 		return fmt.Errorf("serve: mcp: %w", err)
@@ -144,14 +182,14 @@ func runServe(projectDir, dbPath string) error {
 
 // ── watch ──────────────────────────────────────────────────────────────────────
 
-func newWatchCmd(projectDir, dbDir *string) *cobra.Command {
+func newWatchCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	var daemonMode bool
 	cmd := &cobra.Command{
 		Use:   "watch",
 		Short: "Start the codemap daemon in the background (auto-stops after 5 min of inactivity)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, pidPath := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, pidPath := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			if daemonMode {
 				return runWatchDaemon(*projectDir, dbPath, pidPath)
 			}
@@ -165,7 +203,7 @@ func newWatchCmd(projectDir, dbDir *string) *cobra.Command {
 
 func runWatch(projectDir, dbPath, pidPath string) error {
 	if daemon.IsAlive(pidPath) {
-		fmt.Printf("codemap daemon is already running, PIDFILE: %s\n", pidPath)
+		ui.StatusDaemonAlreadyRunning(pidPath)
 		return nil
 	}
 	exe, err := os.Executable()
@@ -175,7 +213,7 @@ func runWatch(projectDir, dbPath, pidPath string) error {
 	if err := daemon.Spawn(exe, rootDir(projectDir)); err != nil {
 		return fmt.Errorf("codemap watch: %w", err)
 	}
-	fmt.Printf("Watcher started, PIDFILE: %s\n", pidPath)
+	ui.StatusWatcherStarted(pidPath)
 	return nil
 }
 
@@ -203,13 +241,13 @@ func runWatchDaemon(projectDir, dbPath, pidPath string) error {
 
 // ── index ──────────────────────────────────────────────────────────────────────
 
-func newIndexCmd(projectDir, dbDir *string) *cobra.Command {
+func newIndexCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "index",
 		Short: "Build or rebuild the symbol index",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			dbPath, _ := resolveStorePaths(*projectDir, *dbDir)
+			dbPath, _ := resolveStorePaths(*projectDir, *dbDir, *dbName)
 			return runIndex(*projectDir, dbPath)
 		},
 	}
@@ -218,16 +256,22 @@ func newIndexCmd(projectDir, dbDir *string) *cobra.Command {
 func runIndex(projectDir, dbPath string) error {
 	ctx := context.Background()
 
+	ui.Banner()
+	ui.StatusStarting(rootDir(projectDir), dbPath)
+
 	srv, err := server.New(ctx, rootDir(projectDir), dbPath, "")
 	if err != nil {
+		ui.StatusFailed(err)
 		return err
 	}
 	defer srv.Close()
 
 	if err := srv.ForceIndex(ctx); err != nil {
+		ui.StatusFailed(err)
 		return err
 	}
 	if err := srv.WaitForIndex(ctx); err != nil {
+		ui.StatusFailed(err)
 		return err
 	}
 
@@ -239,7 +283,8 @@ func runIndex(projectDir, dbPath string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("indexed  nodes=%d  edges=%d\n", nodes, edges)
+
+	ui.StatusIndexed(nodes, edges)
 	return nil
 }
 

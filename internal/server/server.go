@@ -90,12 +90,15 @@ func (s IndexStatus) String() string {
 
 const waitForIndexTimeout = 30 * time.Second
 
+// IndexCallback is called to report indexing progress. May be nil.
+type IndexCallback func(nodes, edges int, elapsed time.Duration)
+
 // Server holds all codemap engine state.
 type Server struct {
-	rootDir  string
-	store    *graph.Store
-	sc       *scanner.Scanner
-	lspSvc   *lsp.Service
+	rootDir   string
+	store     *graph.Store
+	sc        *scanner.Scanner
+	lspSvc    *lsp.Service
 	mcpSrv    *mcp.Server
 	sysprompt string
 
@@ -105,24 +108,32 @@ type Server struct {
 	finishedAt time.Time
 	indexErr   error
 	done       chan struct{} // closed when status transitions to Ready or Failed
-	closeOnce  *sync.Once   // guards close(done); replaced alongside done
+	closeOnce  *sync.Once    // guards close(done); replaced alongside done
+
+	// Optional callback for UI visualization
+	indexCallback IndexCallback
+}
+
+// NewWithCallback creates and starts a Server with an optional indexing callback.
+func NewWithCallback(ctx context.Context, rootDir, dbPath, systemPrompt string, cb IndexCallback) (*Server, error) {
+	return newServer(ctx, rootDir, dbPath, systemPrompt, func() {}, cb)
 }
 
 // New creates and starts a Server for the given project root. The initial
 // index begins immediately in a background goroutine. The file watcher runs
 // until ctx is cancelled.
 func New(ctx context.Context, rootDir, dbPath, systemPrompt string) (*Server, error) {
-	return newServer(ctx, rootDir, dbPath, systemPrompt, func() {})
+	return newServer(ctx, rootDir, dbPath, systemPrompt, func() {}, nil)
 }
 
 // NewWatch is like New but passes cancel to the watcher so that the watcher's
 // idle-timeout fires cancel(), unblocking the caller's <-ctx.Done().
 func NewWatch(ctx context.Context, cancel context.CancelFunc, rootDir, dbPath, systemPrompt string) (*Server, error) {
-	return newServer(ctx, rootDir, dbPath, systemPrompt, cancel)
+	return newServer(ctx, rootDir, dbPath, systemPrompt, cancel, nil)
 }
 
 // newServer is the shared constructor used by New and NewWatch.
-func newServer(ctx context.Context, rootDir, dbPath, systemPrompt string, cancel context.CancelFunc) (*Server, error) {
+func newServer(ctx context.Context, rootDir, dbPath, systemPrompt string, cancel context.CancelFunc, cb IndexCallback) (*Server, error) {
 	absRoot := util.FindGitRoot(rootDir)
 
 	store, err := graph.Open(dbPath)
@@ -135,14 +146,15 @@ func newServer(ctx context.Context, rootDir, dbPath, systemPrompt string, cancel
 	lspSvc := lsp.NewService(absRoot, pm)
 
 	srv := &Server{
-		rootDir:   absRoot,
-		store:     store,
-		sc:        sc,
-		lspSvc:    lspSvc,
-		sysprompt: systemPrompt,
-		status:    IndexStatusIdle,
-		done:      make(chan struct{}),
-		closeOnce: &sync.Once{},
+		rootDir:       absRoot,
+		store:         store,
+		sc:            sc,
+		lspSvc:        lspSvc,
+		sysprompt:     systemPrompt,
+		status:        IndexStatusIdle,
+		done:          make(chan struct{}),
+		closeOnce:     &sync.Once{},
+		indexCallback: cb,
 	}
 
 	srv.registerTools()
@@ -270,6 +282,11 @@ func (srv *Server) doIndex(ctx context.Context) error {
 		return fmt.Errorf("upsert nodes: %w", err)
 	}
 
+	if srv.indexCallback != nil {
+		elapsed := time.Since(srv.startedAt)
+		srv.indexCallback(len(nodes), 0, elapsed)
+	}
+
 	edges, err := srv.lspSvc.Enrich(ctx, nodes, srv.store)
 	if err != nil {
 		return fmt.Errorf("enrich: %w", err)
@@ -282,6 +299,11 @@ func (srv *Server) doIndex(ctx context.Context) error {
 	// Persist any LSP diagnostics that arrived during enrichment.
 	if err := srv.saveDiagnostics(ctx); err != nil {
 		return fmt.Errorf("save diagnostics: %w", err)
+	}
+
+	if srv.indexCallback != nil {
+		elapsed := time.Since(srv.startedAt)
+		srv.indexCallback(len(nodes), len(edges), elapsed)
 	}
 
 	return nil
