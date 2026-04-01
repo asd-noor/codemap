@@ -112,9 +112,9 @@ Start the MCP server over stdio. This is the default when no subcommand is given
 ---
 
 ```
-codemap watch [--daemon]
+codemap watch [--foreground|-f]
 ```
-Spawn a background file-watcher daemon. The daemon re-indexes changed files incrementally and stops itself after **5 minutes of inactivity**. `--daemon` is internal (used by the spawned process).
+Spawn a background file-watcher daemon. The daemon re-indexes changed files incrementally and stops itself after **5 minutes of inactivity**. Pass `--foreground` (or `-f`) to run the watcher in the current process instead — it stays alive until interrupted (SIGINT / SIGTERM) and its lifetime is tied to the parent process. `--daemon` is internal (used by the spawned process).
 
 ---
 

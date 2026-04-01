@@ -184,6 +184,7 @@ func runServe(projectDir, dbPath string) error {
 
 func newWatchCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 	var daemonMode bool
+	var foreground bool
 	cmd := &cobra.Command{
 		Use:   "watch",
 		Short: "Start the codemap daemon in the background (auto-stops after 5 min of inactivity)",
@@ -193,12 +194,35 @@ func newWatchCmd(projectDir, dbDir, dbName *string) *cobra.Command {
 			if daemonMode {
 				return runWatchDaemon(*projectDir, dbPath, pidPath)
 			}
+			if foreground {
+				return runWatchForeground(*projectDir, dbPath)
+			}
 			return runWatch(*projectDir, dbPath, pidPath)
 		},
 	}
 	cmd.Flags().BoolVar(&daemonMode, "daemon", false, "Run in foreground daemon mode (internal use)")
 	cmd.Flags().MarkHidden("daemon") //nolint:errcheck
+	cmd.Flags().BoolVarP(&foreground, "foreground", "f", false, "Run the watcher in the foreground instead of spawning a background daemon")
 	return cmd
+}
+
+func runWatchForeground(projectDir, dbPath string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// Pass a no-op cancel so the watcher's idle timer never self-terminates
+	// the process — lifetime is controlled by the parent/terminal instead.
+	srv, err := server.NewWatch(sigCtx, func() {}, rootDir(projectDir), dbPath, systemPrompt)
+	if err != nil {
+		return fmt.Errorf("codemap watch: %w", err)
+	}
+	defer srv.Close()
+
+	<-sigCtx.Done()
+	return nil
 }
 
 func runWatch(projectDir, dbPath, pidPath string) error {
