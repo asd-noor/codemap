@@ -98,7 +98,7 @@ All subcommands accept two persistent global flags:
 
 | `--db-dir` | DB file location |
 |---|---|
-| Not set | `<cwd>/.codemap` |
+| Not set | `<project-dir>/.codemap` |
 | Set to `<d>` | `<d>/codemap.sqlite` |
 
 ### Subcommands

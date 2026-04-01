@@ -52,7 +52,7 @@ All sub-commands share --project-dir and --db-dir:
 	}
 
 	root.PersistentFlags().StringVar(&projectDir, "project-dir", "", "Project directory (default: auto-detected git root from CWD)")
-	root.PersistentFlags().StringVar(&dbDir, "db-dir", "", "Database directory override. If set, DB is at <db-dir>/codemap.sqlite; default is <cwd>/.codemap")
+	root.PersistentFlags().StringVar(&dbDir, "db-dir", "", "Database directory override. If set, DB is at <db-dir>/codemap.sqlite; default is <project-dir>/.codemap")
 
 	root.AddCommand(
 		newServeCmd(&projectDir, &dbDir),
@@ -72,17 +72,13 @@ All sub-commands share --project-dir and --db-dir:
 
 // resolveStorePaths computes the SQLite file path and PID file path from flags.
 //
-//	--db-dir not set  →  dbPath = <cwd>/.codemap        pidPath = <cwd>/.codemap.pid
+//	--db-dir not set  →  dbPath = <project-dir>/.codemap pidPath = <project-dir>/.codemap.pid
 //	--db-dir=<d>      →  dbPath = <d>/codemap.sqlite    pidPath = <d>/codemap.pid
 func resolveStorePaths(projectDir, dbDirFlag string) (dbPath, pidPath string) {
 	if dbDirFlag == "" {
 		base := resolveProjectDir(projectDir)
-		cwd, err := os.Getwd()
-		if err != nil {
-			cwd = base
-		}
-		return filepath.Join(cwd, ".codemap"),
-			filepath.Join(cwd, ".codemap.pid")
+		return filepath.Join(base, ".codemap"),
+			filepath.Join(base, ".codemap.pid")
 	}
 	abs, err := filepath.Abs(dbDirFlag)
 	if err != nil {
